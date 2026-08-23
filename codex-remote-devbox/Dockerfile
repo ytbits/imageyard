@@ -1,7 +1,7 @@
 FROM node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
 
 ARG CODEX_VERSION="0.149.0"
-ARG IMAGE_VERSION="codex-0.149.0-r1"
+ARG IMAGE_VERSION="codex-0.149.0-r2"
 
 LABEL org.opencontainers.image.title="Codex Remote Devbox" \
       org.opencontainers.image.description="SSH-accessible remote development environment for Codex Desktop" \
@@ -50,7 +50,7 @@ RUN set -eux; \
     groupmod --new-name codex node; \
     usermod --login codex --home /home/codex --move-home --shell /bin/bash node; \
     passwd --delete codex; \
-    install -d -o codex -g codex -m 0755 /home/codex /workspaces; \
+    install -d -o codex -g codex -m 0700 /home/codex /workspaces; \
     install -d -o root -g root -m 0755 /run/sshd; \
     ln -s /usr/bin/fdfind /usr/local/bin/fd; \
     printf '%s\n' 'codex ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/codex; \

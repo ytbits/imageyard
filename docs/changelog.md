@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-22 - Bootstrap Codex Remote Devbox State Mounts
+
+- Bumped the Codex remote devbox packaging revision to `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2` without changing Codex CLI `0.149.0`.
+- Required explicit mountpoints at `/home/codex` and `/workspaces`; missing, parent-only, invalid, symlinked, read-only, or unusable state roots now fail closed before SSH starts.
+- Added image-native, nonrecursive bootstrap that normalizes only each mount root to UID/GID `1000` and mode `0700`, performs a temporary write probe as `codex`, and preserves all descendant state.
+- Locked the secret contract so validation completes before state mutation, key sources remain unchanged, runtime copies stay under `/run`, and key material never enters state or logs.
+- Locked the root `tini -g` to entrypoint to foreground sshd process contract and the bounded signal-driven shutdown requirement.
+- Expanded release guidance and validation expectations for no-copy named volumes, bootstrap idempotence, nested metadata preservation, invalid state roots, secret non-interference, and both native architectures.
+
 ## 2026-08-22 - Add Codex Remote Devbox Image
 
 - Added the `codex-remote-devbox` SSH image for Codex Desktop remote connections, based on the digest-pinned Node 24 Bookworm image with Codex CLI `0.149.0`.

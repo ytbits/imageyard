@@ -8,13 +8,113 @@ authorized_keys_runtime="$runtime_dir/authorized_keys"
 host_key_runtime="$runtime_dir/ssh_host_ed25519_key"
 authorized_keys_validation="$runtime_dir/authorized_keys.validation"
 authorized_key_validation="$runtime_dir/authorized_key.validation"
+mountinfo=/proc/self/mountinfo
+state_probe=
+
+cleanup_state_probe() {
+  if [ -n "$state_probe" ]; then
+    rm -f -- "$state_probe" >/dev/null 2>&1 || :
+    state_probe=
+  fi
+}
 
 fail() {
+  cleanup_state_probe
   printf '%s\n' "codex-remote-devbox: $*" >&2
   exit 1
 }
 
+handle_signal() {
+  signal_status=$1
+  trap - HUP INT TERM
+  cleanup_state_probe
+  exit "$signal_status"
+}
+
+is_exact_mountpoint() {
+  awk -v expected="$1" '
+    $5 == expected { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$mountinfo"
+}
+
+validate_state_root() {
+  state_root=$1
+
+  [ ! -L "$state_root" ] \
+    || fail "required state root is a symbolic link: $state_root"
+  [ -e "$state_root" ] || fail "required state root is missing: $state_root"
+  [ -d "$state_root" ] \
+    || fail "required state root is not a directory: $state_root"
+  is_exact_mountpoint "$state_root" \
+    || fail "required state root is not an exact mountpoint: $state_root"
+}
+
+bootstrap_state_root() {
+  state_root=$1
+
+  state_owner="$(stat -c '%u:%g' -- "$state_root" 2>/dev/null)" \
+    || fail "could not inspect state root ownership: $state_root"
+  if [ "$state_owner" != 1000:1000 ]; then
+    chown 1000:1000 -- "$state_root" \
+      || fail "could not set state root ownership: $state_root"
+  fi
+
+  state_mode="$(stat -c '%a' -- "$state_root" 2>/dev/null)" \
+    || fail "could not inspect state root mode: $state_root"
+  if [ "$state_mode" != 700 ]; then
+    chmod 0700 -- "$state_root" \
+      || fail "could not set state root mode: $state_root"
+  fi
+
+  [ ! -L "$state_root" ] \
+    || fail "state root became a symbolic link: $state_root"
+  [ -d "$state_root" ] \
+    || fail "state root is no longer a directory: $state_root"
+  is_exact_mountpoint "$state_root" \
+    || fail "state root is no longer an exact mountpoint: $state_root"
+  [ "$(stat -c '%u:%g:%a' -- "$state_root" 2>/dev/null)" = 1000:1000:700 ] \
+    || fail "state root metadata verification failed: $state_root"
+
+  probe_token=
+  IFS= read -r probe_token < /proc/sys/kernel/random/uuid \
+    || fail "could not allocate state root write probe: $state_root"
+  case "$probe_token" in
+    ''|*[!0-9a-f-]*)
+      fail "could not allocate state root write probe: $state_root"
+      ;;
+  esac
+  probe_candidate="$state_root/.codex-remote-devbox-write-test.$probe_token"
+  [ ! -e "$probe_candidate" ] && [ ! -L "$probe_candidate" ] \
+    || fail "could not allocate state root write probe: $state_root"
+  state_probe=$probe_candidate
+  sudo -n -u codex -- /bin/sh -c \
+    'set -C; umask 077; : > "$1"' state-write-probe "$state_probe" \
+    2>/dev/null || fail "codex cannot create files in state root: $state_root"
+  sudo -n -u codex -- rm -f -- "$state_probe" >/dev/null 2>&1 \
+    || fail "codex cannot remove files from state root: $state_root"
+  state_probe=
+}
+
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
 [ "$(id -u)" = 0 ] || fail "entrypoint must run as root"
+
+codex_uid="$(id -u codex 2>/dev/null)" || fail "codex account is unavailable"
+[ "$codex_uid" = 1000 ] || fail "codex UID is not 1000"
+codex_gid="$(id -g codex 2>/dev/null)" || fail "codex account is unavailable"
+[ "$codex_gid" = 1000 ] || fail "codex GID is not 1000"
+codex_passwd="$(getent passwd codex 2>/dev/null)" \
+  || fail "codex account is unavailable"
+[ "$(printf '%s\n' "$codex_passwd" | cut -d: -f7)" = /bin/bash ] \
+  || fail "codex login shell is not /bin/bash"
+
+[ -r "$mountinfo" ] || fail "mount table is unavailable"
+for state_root in /home/codex /workspaces; do
+  validate_state_root "$state_root"
+done
 
 for required_file in "$authorized_keys_source" "$host_key_source"; do
   [ -f "$required_file" ] || fail "required runtime key file is missing: $required_file"
@@ -54,18 +154,12 @@ host_key_type="$(ssh-keygen -y -f "$host_key_runtime" 2>/dev/null | awk 'NR == 1
 [ "$host_key_type" = ssh-ed25519 ] \
   || fail "host key is not a valid Ed25519 private key"
 
-for writable_path in /home/codex /workspaces; do
-  [ -d "$writable_path" ] || fail "required path is missing: $writable_path"
-  sudo -n -u codex -- test -w "$writable_path" \
-    || fail "required path is not writable by codex: $writable_path"
-done
-
-[ "$(id -u codex)" = 1000 ] || fail "codex UID is not 1000"
-[ "$(id -g codex)" = 1000 ] || fail "codex GID is not 1000"
-[ "$(getent passwd codex | cut -d: -f7)" = /bin/bash ] \
-  || fail "codex login shell is not /bin/bash"
-
 /usr/sbin/sshd -t -f /etc/ssh/sshd_config \
   || fail "OpenSSH configuration validation failed"
 
+for state_root in /home/codex /workspaces; do
+  bootstrap_state_root "$state_root"
+done
+
+trap - HUP INT TERM
 exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config
