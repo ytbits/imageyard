@@ -54,20 +54,22 @@ imageyard/
 - Base image: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
 - Codex CLI package: `@openai/codex@0.149.0`
 - Published platforms: `linux/amd64`, `linux/arm64`
-- Canonical tag: `codex-0.149.0-r1`
-- Published image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r1`
+- Canonical tag: `codex-0.149.0-r2`
+- Release target: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2`
 - SSH interface: TCP `2222`, public-key-only login as `codex` UID/GID `1000` with Bash
-- State paths: `/home/codex` and `/workspaces`
+- Required state mountpoints: `/home/codex` and `/workspaces`
 - Authorized keys: `/run/secrets/ssh-access/authorized_keys`
 - Ed25519 host key: `/run/secrets/ssh-host/ssh_host_ed25519_key`
 - Startup: root `tini` to foreground OpenSSH; authenticated sessions run as `codex`
-- Smoke tests: both architectures, positive and negative SSH authentication, user and sudo contract, tool boundaries, Codex app-server command availability, stable host identity, persistence, listener checks, and secret absence
+- Smoke tests: both architectures, required mountpoints, fresh-volume bootstrap, nested metadata preservation, idempotence, positive and negative SSH authentication, state and secret failure cases, user and sudo contract, tool boundaries, app-server command availability, stable host identity, persistence, listener checks, secret non-interference, and signal-driven shutdown
 
-The authorized-keys input accepts bare OpenSSH public-key lines only; per-key options are not part of the image contract. The Codex remote devbox is a trusted, single-user development image. It grants `codex` full passwordless sudo as an explicit exception, but it must not require privileged mode, a Docker socket, or broad host-filesystem access beyond the documented key and state mounts. It includes a lean Node, Python, Git, GitHub CLI, SSH, and build toolset and excludes Docker, Kubernetes and infrastructure CLIs, `nvm`, and `pyenv`.
+Both `/home/codex` and `/workspaces` must be real, non-symlink directories and exact mountpoints listed in `/proc/self/mountinfo`; an image-layer directory or parent-only mount is insufficient. The entrypoint validates both mountpoints, the fixed `codex` identity, the SSH inputs, and OpenSSH configuration before changing state. It then non-recursively normalizes only each mount root to UID/GID `1000` and mode `0700`, requires that exact postcondition, and runs a temporary create/remove probe as `codex`. It must never seed, wipe, recursively change, or migrate descendant data. Any invalid, read-only, or unusable root fails closed before SSH starts.
+
+The authorized-keys input accepts bare OpenSSH public-key lines only; per-key options are not part of the image contract. Source keys are read-only inputs: copy them to root-owned runtime files without modifying their bytes or metadata, writing them into state, or printing them. The Codex remote devbox is a trusted, single-user development image. It grants `codex` full passwordless sudo as an explicit exception, but it must not require privileged mode, a Docker socket, or broad host-filesystem access beyond the documented key and state mounts. It includes a lean Node, Python, Git, GitHub CLI, SSH, and build toolset and excludes Docker, Kubernetes and infrastructure CLIs, `nvm`, and `pyenv`.
 
 The image must fail closed when either runtime SSH key is missing, empty, invalid, or unsafe. It must never generate an ephemeral host identity, print key material, or bake Codex, GitHub, API, SSH, or user credentials into an image layer, build argument, label, or test fixture. Interactive authentication is performed after connection, and persistent user state is an external runtime concern.
 
-Codex Desktop starts the remote app server through SSH. The image must expose only SSH, must not prestart or publish an app-server listener, and must keep the remote login shell's `PATH` free of noisy interactive-only setup.
+Codex Desktop starts the remote app server through SSH. The image must expose only SSH, must not prestart or publish an app-server listener, and must keep the remote login shell's `PATH` free of noisy interactive-only setup. The process contract is root `tini -g` to the root entrypoint to `exec` foreground OpenSSH; termination signals must reach the process group and stop both sshd and active sessions within the bounded shutdown test.
 
 Codex remote devbox tags use `codex-<CODEX_VERSION>-r<REVISION>`. Reset to `r1` when Codex changes; increment the revision for packaging changes at the same Codex version. Never publish or overwrite a moving tag. Base-image and system-package versions belong in the Dockerfile, OCI labels, and documentation, not in the tag.
 

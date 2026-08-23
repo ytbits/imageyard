@@ -44,19 +44,21 @@ imageyard/
 
 The `codex-remote-devbox/` directory defines an SSH-accessible development environment for Codex Desktop remote connections:
 
-- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r1`
+- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2`
 - Dockerfile and build context: `codex-remote-devbox/Dockerfile` and `codex-remote-devbox/`
 - Base: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
 - Codex CLI: `@openai/codex@0.149.0`
 - Published platforms: `linux/amd64`, `linux/arm64`
 - SSH contract: port `2222`, user `codex` with UID/GID `1000` and Bash
-- State paths: `/home/codex` and `/workspaces`
+- Required state mountpoints: `/home/codex` and `/workspaces`
 - Runtime access key: `/run/secrets/ssh-access/authorized_keys`
 - Runtime host key: `/run/secrets/ssh-host/ssh_host_ed25519_key`
 
-The authorized-keys file accepts one or more bare OpenSSH public-key lines; per-key options are intentionally not accepted. The root container process runs `tini` and OpenSSH; authenticated sessions enter as `codex`. SSH is public-key-only and fails closed when either runtime key is missing or invalid. The image grants `codex` full passwordless sudo as an explicit single-user development convenience, but it does not require privileged mode, a Docker socket, or broad host-filesystem access beyond the documented key and state mounts.
+Both state paths must be explicit mountpoints; image-layer directories or a mount on only a parent path do not satisfy the contract. After validating the fixed identity, mount types, runtime keys, and OpenSSH configuration, the root entrypoint bootstraps only the two mount roots to UID/GID `1000` and mode `0700`, then verifies that `codex` can create and remove a temporary probe. Bootstrap is nonrecursive: it never seeds, wipes, changes, or migrates existing descendants. A missing, non-directory, symlinked, non-mountpoint, read-only, or otherwise unusable state root fails closed before SSH starts.
 
-The image includes a lean Node, Python, Git, GitHub CLI, SSH, and build toolset. It deliberately excludes Docker, Kubernetes tools, infrastructure CLIs, `nvm`, and `pyenv`. No Codex, GitHub, API, SSH, or user credentials are included in the image. Authenticate after connecting with `codex login --device-auth` and `gh auth login --git-protocol https`; mount persistent storage at `/home/codex` if that state must survive replacement.
+The authorized-keys file accepts one or more bare OpenSSH public-key lines; per-key options are intentionally not accepted. Runtime key sources are treated as read-only inputs, copied into root-owned runtime files, and never written into either state mount. The root process chain remains `tini -g` to the entrypoint to foreground OpenSSH; authenticated sessions enter as `codex`, and termination signals are forwarded through that chain for bounded shutdown. SSH is public-key-only and fails closed when either runtime key is missing or invalid. The image grants `codex` full passwordless sudo as an explicit single-user development convenience, but it does not require privileged mode, a Docker socket, or broad host-filesystem access beyond the documented key and state mounts.
+
+The image includes a lean Node, Python, Git, GitHub CLI, SSH, and build toolset. It deliberately excludes Docker, Kubernetes tools, infrastructure CLIs, `nvm`, and `pyenv`. No Codex, GitHub, API, SSH, or user credentials are included in the image. Authenticate after connecting with `codex login --device-auth` and `gh auth login --git-protocol https`; persist both required state mountpoints across replacement when their contents must survive.
 
 Codex Desktop starts its app server through the SSH connection, so the image does not start or expose an app-server listener. See the official [remote connections](https://learn.chatgpt.com/docs/remote-connections) and [authentication](https://learn.chatgpt.com/docs/auth) documentation.
 
