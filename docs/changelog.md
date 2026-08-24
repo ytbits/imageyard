@@ -7,6 +7,7 @@
 - Added a fail-closed read-only Docker-host Secret contract with Ed25519 client-key and alias-keyed known-host fingerprint verification, runtime-only key copies, a strict system `docker-host`/`HostKeyAlias docker-host` SSH stanza, and runtime sshd `DOCKER_HOST` injection without `DOCKER_CONTEXT`.
 - Kept remote-host reachability out of startup readiness so a valid offline Mac can recover without a Pod restart, and documented that remote bind mounts resolve on the Mac daemon rather than under `/workspaces`.
 - Expanded two-architecture validation and publication evidence for exact Docker package versions, malformed and mismatched Secret bundles, source/runtime immutability, interactive and command SSH environments, daemon exclusions, config digests, and post-publication smoke.
+- Added bounded, read-only post-push registry-visibility retries anchored to the pushed immutable index digest; the verifier never retries publication.
 
 ## 2026-08-22 - Bootstrap Codex Remote Devbox State Mounts
 

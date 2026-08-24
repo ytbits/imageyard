@@ -265,6 +265,8 @@ Record in the release or pull-request evidence:
 
 Pull and smoke-test the exact published index digest on each available native platform. Confirm its OCI labels identify the source repository, source revision, base image, exact Codex version, exact Docker packages, and apt-key checksum. Anonymous inspection and pull must work without registry credentials.
 
+GHCR may briefly return a read error immediately after accepting a new tag. Post-push verification uses bounded read-only retries, first proves that the tag resolves to the action's pushed index digest, and then derives every platform and config digest through that immutable reference. The retry loop never repeats the push. If it exhausts or any digest differs, preserve the published tag, inspect it independently, and do not rerun a publishing attempt against the same revision.
+
 Docker build contexts are sent from the devbox client to the Mac engine. Bind mounts are different: the daemon resolves their source paths on the Mac, so a Compose entry such as `.:/app` does not mount the devbox's `/workspaces` directory. Build the content into an image, synchronize it to the Mac, or use another explicit remote-development workflow.
 
 ## Rollback and failed releases

@@ -66,7 +66,7 @@ The image must provide a stable remote-user contract, accept credentials only at
 - Validate shell and workflow syntax, build and run both target platforms, exercise SSH authentication and negative cases, and inspect the image for the documented runtime contract.
 - Use no-copy named volumes to exercise fresh root-owned mount bootstrap. Verify mandatory exact mountpoints, root-only normalization, nested metadata preservation, idempotent replacement, actual write probes, read-only and invalid-root failures, secret non-interference, and signal-driven shutdown on both architectures.
 - Before publication, authenticate to GHCR and check the exact immutable tag. Repeat the check immediately before pushing. A present tag, an ambiguous response, or an unavailable registry fails closed.
-- Publish a single multi-architecture OCI index under the immutable release tag and record the index and platform digests.
+- Publish a single multi-architecture OCI index under the immutable release tag and record the index and platform digests. Use bounded read-only retries for transient post-push registry visibility, while anchoring every inspection to the pushed index digest and never retrying the push.
 - Verify the Docker package outputs, runtime bundle failure cases, source immutability, runtime ownership and modes, effective SSH configuration, session environment, offline-target readiness, daemon exclusions, and absence of secret material on both native architectures.
 
 ## Consequences

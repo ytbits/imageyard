@@ -183,19 +183,38 @@ jobs:
           set -euo pipefail
 
           inspect_log="$(mktemp)"
+          inspect_error="$(mktemp)"
+          tag_inspect="$(mktemp)"
           index_raw="$(mktemp)"
-          trap 'rm -f "$inspect_log" "$index_raw"' EXIT
+          amd64_manifest_raw="$(mktemp)"
+          arm64_manifest_raw="$(mktemp)"
+          trap 'rm -f "$inspect_log" "$inspect_error" "$tag_inspect" "$index_raw" "$amd64_manifest_raw" "$arm64_manifest_raw"' EXIT
           [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
 
-          tag_digest="$(
-            docker buildx imagetools inspect "$IMAGE_REF" \
-              | awk '$1 == "Digest:" { print $2; exit }'
-          )"
+          inspect_with_retry() {
+            local output_path=$1
+            local attempt=1
+            shift
+
+            while ! docker buildx imagetools inspect "$@" > "$output_path" 2> "$inspect_error"; do
+              if (( attempt >= 12 )); then
+                cat "$inspect_error" >&2
+                return 1
+              fi
+              echo "Registry inspection attempt ${attempt} failed; retrying read-only verification" >&2
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+          }
+
+          inspect_with_retry "$tag_inspect" "$IMAGE_REF"
+          tag_digest="$(awk '$1 == "Digest:" { print $2; exit }' "$tag_inspect")"
           [[ "$tag_digest" == "$INDEX_DIGEST" ]]
 
           immutable_ref="${IMAGE}@${INDEX_DIGEST}"
-          docker buildx imagetools inspect "$immutable_ref" | tee "$inspect_log"
-          docker buildx imagetools inspect --raw "$immutable_ref" > "$index_raw"
+          inspect_with_retry "$inspect_log" "$immutable_ref"
+          cat "$inspect_log"
+          inspect_with_retry "$index_raw" --raw "$immutable_ref"
 
           grep -Fq "Platform:    linux/amd64" "$inspect_log"
           grep -Fq "Platform:    linux/arm64" "$inspect_log"
@@ -208,12 +227,10 @@ jobs:
             jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | if length == 1 then .[0].digest else error("expected exactly one linux/arm64 manifest") end' \
               "$index_raw"
           )"
-          amd64_config_digest="$(
-            docker buildx imagetools inspect --raw "${IMAGE}@${amd64_digest}" | jq -er '.config.digest'
-          )"
-          arm64_config_digest="$(
-            docker buildx imagetools inspect --raw "${IMAGE}@${arm64_digest}" | jq -er '.config.digest'
-          )"
+          inspect_with_retry "$amd64_manifest_raw" --raw "${IMAGE}@${amd64_digest}"
+          inspect_with_retry "$arm64_manifest_raw" --raw "${IMAGE}@${arm64_digest}"
+          amd64_config_digest="$(jq -er '.config.digest' "$amd64_manifest_raw")"
+          arm64_config_digest="$(jq -er '.config.digest' "$arm64_manifest_raw")"
 
           {
             echo "### Codex Remote Devbox published"

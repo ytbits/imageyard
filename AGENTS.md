@@ -81,7 +81,7 @@ Codex Desktop starts the remote app server through SSH. The image must expose on
 
 Codex remote devbox tags use `codex-<CODEX_VERSION>-r<REVISION>`. Reset to `r1` when Codex changes; increment the revision for packaging changes at the same Codex version. Never publish or overwrite a moving tag. Base-image and system-package versions belong in the Dockerfile, OCI labels, and documentation, not in the tag.
 
-Validation and publication remain separate. The validation workflow has read-only repository permissions and builds and smoke-tests both target platforms. The publish workflow is limited to image-producing changes on `main` or manual dispatches targeting `main`, owns the GHCR write permission, and checks the exact immutable tag before building and again immediately before pushing. Registry authentication, network, or ambiguous-not-found failures must stop publication.
+Validation and publication remain separate. The validation workflow has read-only repository permissions and builds and smoke-tests both target platforms. The publish workflow is limited to image-producing changes on `main` or manual dispatches targeting `main`, owns the GHCR write permission, and checks the exact immutable tag before building and again immediately before pushing. Registry authentication, network, or ambiguous-not-found failures must stop publication. After a successful push, bounded read-only retries may tolerate registry read-after-write visibility, but all evidence must remain anchored to the pushed index digest; retry exhaustion or any digest mismatch fails verification and must never cause a republish.
 
 ### Multica Codex Runtime
 
