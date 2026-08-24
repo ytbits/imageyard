@@ -5,31 +5,53 @@ This runbook covers building, validating, publishing, verifying, and rolling bac
 ## Current release contract
 
 - Image: `ghcr.io/ytbits/codex-remote-devbox`
-- Tag: `codex-0.149.0-r2`
+- Tag: `codex-0.149.0-r3`
 - Build context: `codex-remote-devbox/`
 - Dockerfile: `codex-remote-devbox/Dockerfile`
 - Platforms: `linux/amd64`, `linux/arm64`
 - Base: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
 - Codex package: `@openai/codex@0.149.0`
+- Docker packages: `docker-ce-cli=5:29.7.2-1~debian.12~bookworm`, `docker-buildx-plugin=0.36.1-1~debian.12~bookworm`, and `docker-compose-plugin=5.5.0-1~debian.12~bookworm`
 
 Tags use `codex-<CODEX_VERSION>-r<REVISION>`. A Codex upgrade starts at `r1`; a packaging-only change for the same Codex version increments the revision. Never reuse or overwrite a published tag, and never publish a moving alias.
 
-`codex-0.149.0-r1` remains the historical initial release. Revision `r2` adds the mandatory state-mount bootstrap contract without changing the Codex version.
+`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` adds only the pinned Docker clients and a fail-closed remote-Docker SSH bundle; Codex and all `r2` state, SSH-server, `tini`, signal, and no-init-container behavior remain unchanged.
 
 The runtime authorized-keys file accepts bare OpenSSH public-key lines only. Do not add per-key options or place a private key, known-hosts file, or another key format at that path.
 
 ## Runtime mount contract
 
-Every start must provide four explicit mounts:
+Every start must provide five logical mount sources:
 
 - a state mount at `/home/codex`;
 - a state mount at `/workspaces`;
 - the authorized-keys file at `/run/secrets/ssh-access/authorized_keys`, read-only;
-- the Ed25519 host private key at `/run/secrets/ssh-host/ssh_host_ed25519_key`, read-only.
+- the Ed25519 host private key at `/run/secrets/ssh-host/ssh_host_ed25519_key`, read-only;
+- the Docker-host source directory at `/run/secrets/docker-host`, read-only.
 
 The two state paths must each be real, non-symlink directories and exact mountpoints. Mounting only `/home`, `/`, or another parent does not qualify. After validating identity, mount types, SSH inputs, and OpenSSH configuration, the entrypoint normalizes only each state-mount root to UID/GID `1000` and mode `0700`. It never recursively changes, seeds, wipes, or migrates descendants. It then creates and removes a randomized probe as `codex`; a missing, invalid, read-only, or otherwise unusable mount fails closed before sshd starts.
 
-Validated SSH inputs are copied to root-owned runtime files. The entrypoint must not alter source bytes or metadata, log key material, or copy key material into either state mount. The runtime process chain is root `tini -g` to the root entrypoint to `exec` foreground sshd so termination signals reach sshd and its active sessions.
+The Docker-host directory must contain these exact regular, non-symlink, nonempty files:
+
+```text
+docker_host
+ssh_alias
+ssh_host
+ssh_port
+ssh_user
+ssh_client_ed25519_private_key
+ssh_client_ed25519_fingerprint
+ssh_host_ed25519_fingerprint
+ssh_known_hosts
+```
+
+Use mode `0400` for `ssh_client_ed25519_private_key` and `0444` for the other inputs. `ssh_alias` must be exactly `docker-host`, and the generated OpenSSH stanza sets `HostKeyAlias docker-host` while retaining `ssh_host` as the real MagicDNS `HostName`. The private key must be Ed25519 and match its stored SHA-256 fingerprint. `ssh_known_hosts` must contain exactly one Ed25519 entry keyed by `docker-host` and match the stored host fingerprint. A Docker SSH URL may include the non-default Mac socket path, for example `ssh://docker-host/Users/codex-smoke/.docker/run/docker.sock`.
+
+Validated SSH-server inputs are copied to root-owned runtime files. The Docker client private key and known-hosts entry are copied on every start to `/run/codex-remote-devbox/docker-host/` as UID/GID `1000`, mode `0600`. The entrypoint generates the root-owned system `Host docker-host` configuration and a runtime sshd configuration that injects only `DOCKER_HOST` into interactive and command sessions. It does not modify `~/.ssh`, persist shared Docker credentials under `/home/codex`, set `DOCKER_CONTEXT`, alter source bytes or metadata, log values or fingerprints, or contact the Mac during validation. A valid offline target therefore still reaches SSH readiness.
+
+Kubernetes mounts must make all nine source paths regular files at the exact names. A projected Secret's symlink front-end does not meet the non-symlink contract; mount each Secret item read-only at its final path with an explicit `subPath` file mount, with the private key at `0400` and the remaining inputs at `0444`. Together with the two state mounts and two SSH-server key mounts, that is thirteen `volumeMounts`, even though the Docker-host bundle is one logical source. Secret updates require Pod replacement: `subPath` mounts do not receive projected updates, and the entrypoint intentionally copies the validated key and pin only at container start.
+
+The runtime process chain is root `tini -g` to the root entrypoint to `exec` foreground sshd using the validated runtime configuration so termination signals reach sshd and its active sessions.
 
 ## Prepare a release
 
@@ -37,8 +59,9 @@ Validated SSH inputs are copied to root-owned runtime files. The entrypoint must
 2. Select the current non-prerelease Codex npm release and pin the exact version in the Dockerfile and workflow release constants.
 3. Confirm that the package supports both target architectures.
 4. Pin the exact Node image version and manifest-list digest. Record both in the Dockerfile, image contract, and release documentation.
-5. Choose the tag revision according to the rule above and update every release reference together.
-6. Update `README.md`, `AGENTS.md`, `docs/changelog.md`, this runbook, and the ADR if the durable contract changed.
+5. Query Docker's official Bookworm repository for the current amd64 and arm64 candidates, verify the downloaded apt-key SHA-256, and pin the full Debian versions for the CLI, Buildx, and Compose packages.
+6. Choose the tag revision according to the rule above and update every release reference together.
+7. Update `README.md`, `AGENTS.md`, `docs/changelog.md`, this runbook, and the ADR if the durable contract changed.
 
 Do not put credentials, local configuration, SSH keys, private hosts, or deployment-specific examples in the build context, documentation, labels, build arguments, or workflow logs.
 
@@ -67,7 +90,7 @@ Run the automated smoke test:
 codex-remote-devbox/smoke-test.sh imageyard/codex-remote-devbox:smoke
 ```
 
-The smoke test creates disposable named volumes with copy-up disabled, so fresh root-owned volume roots exercise the image bootstrap rather than inheriting the ownership of the baked directories. For an equivalent manual start, create temporary keys and two named volumes:
+The smoke test creates disposable named volumes with copy-up disabled, so fresh root-owned volume roots exercise the image bootstrap rather than inheriting the ownership of the baked directories. For an equivalent offline-target manual start, create temporary keys, a complete Docker-host bundle, and two named volumes:
 
 ```bash
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-devbox-local.XXXXXX")"
@@ -75,12 +98,32 @@ home_volume="codex-devbox-home-$$"
 workspaces_volume="codex-devbox-workspaces-$$"
 container_name="codex-devbox-local-$$"
 
-mkdir -p "$fixture_dir/access" "$fixture_dir/host"
+mkdir -p "$fixture_dir/access" "$fixture_dir/host" "$fixture_dir/docker-host"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/client_key"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/host/ssh_host_ed25519_key"
+ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/docker_client_key"
+ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/docker_target_host_key"
 cp "$fixture_dir/client_key.pub" "$fixture_dir/access/authorized_keys"
-chmod 0400 "$fixture_dir/client_key" "$fixture_dir/host/ssh_host_ed25519_key"
-chmod 0444 "$fixture_dir/access/authorized_keys"
+cp "$fixture_dir/docker_client_key" \
+  "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
+ssh-keygen -l -E sha256 -f "$fixture_dir/docker_client_key.pub" \
+  | awk '{print $2}' > "$fixture_dir/docker-host/ssh_client_ed25519_fingerprint"
+ssh-keygen -l -E sha256 -f "$fixture_dir/docker_target_host_key.pub" \
+  | awk '{print $2}' > "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint"
+printf '%s %s\n' docker-host \
+  "$(cut -d ' ' -f 1-2 "$fixture_dir/docker_target_host_key.pub")" \
+  > "$fixture_dir/docker-host/ssh_known_hosts"
+printf '%s\n' 'ssh://docker-host/Users/codex-smoke/.docker/run/docker.sock' \
+  > "$fixture_dir/docker-host/docker_host"
+printf '%s\n' docker-host > "$fixture_dir/docker-host/ssh_alias"
+printf '%s\n' docker.invalid > "$fixture_dir/docker-host/ssh_host"
+printf '%s\n' 22 > "$fixture_dir/docker-host/ssh_port"
+printf '%s\n' codex-smoke > "$fixture_dir/docker-host/ssh_user"
+chmod 0444 "$fixture_dir/access/authorized_keys" "$fixture_dir/docker-host"/*
+chmod 0400 \
+  "$fixture_dir/client_key" \
+  "$fixture_dir/host/ssh_host_ed25519_key" \
+  "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
 
 docker volume create "$home_volume"
 docker volume create "$workspaces_volume"
@@ -91,6 +134,7 @@ docker run --detach \
   --mount "type=volume,src=${workspaces_volume},dst=/workspaces,volume-nocopy" \
   --mount "type=bind,src=${fixture_dir}/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
   --mount "type=bind,src=${fixture_dir}/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
+  --mount "type=bind,src=${fixture_dir}/docker-host,dst=/run/secrets/docker-host,readonly" \
   imageyard/codex-remote-devbox:smoke
 
 for attempt in $(seq 1 60); do
@@ -123,7 +167,7 @@ ssh \
   codex@127.0.0.1
 ```
 
-Both `stat` rows must report `1000:1000 700`. Remove the disposable container and volumes after the check; retaining either named volume intentionally retains its state.
+Both `stat` rows must report `1000:1000 700`. The deliberately unreachable `docker.invalid` target must not delay SSH readiness. Inside the SSH session, `DOCKER_HOST` must equal the bundle value and `DOCKER_CONTEXT` must be absent; a Docker command is expected to fail until the real Mac becomes reachable. Remove the disposable container and volumes after the check; retaining either named volume intentionally retains its state.
 
 Before publication, repeat the build and smoke test on a native ARM64 host rather than through emulation:
 
@@ -146,12 +190,17 @@ The smoke test must use temporary Ed25519 client and host keys and must verify a
 - bootstrap is idempotent across replacement and preserves nested content, ownership, modes, timestamps, symlinks, and hard links;
 - temporary write probes are removed, and failed secret validation leaves both state mounts unchanged;
 - SSH source files retain their bytes and metadata and never appear in state, image layers, history, or logs;
+- the Docker CLI reports `29.7.2`, Buildx reports `0.36.1`, Compose reports `5.5.0`, and `dpkg-query` reports the exact pinned Bookworm package versions;
+- Docker Engine, `dockerd`, `containerd`, DinD, Podman, nerdctl, a local Docker socket, and Docker daemon listeners are absent;
+- every missing, empty, symlinked, malformed, wrong-alias, bad-key, bad-fingerprint, or bad-known-host Docker bundle case fails before SSH and before state mutation;
+- the valid offline bundle reaches SSH readiness, preserves all source bytes and metadata, creates only UID/GID `1000` mode `0600` runtime key/pin copies, and leaks no value, fingerprint, or key into logs, image layers, `/home/codex`, or `/workspaces`;
+- both interactive and command SSH sessions receive `DOCKER_HOST`, neither receives `DOCKER_CONTEXT`, and effective `ssh -G docker-host` contains `HostName <MagicDNS host>`, `HostKeyAlias docker-host`, and the other fail-closed options without changing unrelated Home state;
 - the SSH session is UID/GID `1000` and Bash is the login shell;
 - `sudo -n id -u` returns `0`;
 - `codex --version` reports `0.149.0` and `codex app-server --help` succeeds;
-- the lean toolset is present while Docker and infrastructure CLIs are absent;
+- the lean toolset and pinned Docker clients are present while daemon, Kubernetes, and infrastructure tooling is absent;
 - SSH listens only on `2222`, emits no login banner, and no Codex app server is prestarted;
-- the container starts without privileged mode, a Docker socket, or mounts beyond the documented key and state paths;
+- the container starts without privileged mode, a local Docker socket, or mounts beyond the documented Secret and state paths;
 - the image and its history contain no test key or token marker;
 - reusing the same externally supplied host key preserves the SSH fingerprint;
 - mounted home and workspace directories preserve state across container replacement;
@@ -193,7 +242,7 @@ If authentication is needed, perform it inside the trusted SSH session with `cod
 The target for this release is:
 
 ```text
-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2
+ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3
 ```
 
 ## Verify publication
@@ -202,7 +251,7 @@ Inspect the remote OCI index:
 
 ```bash
 docker buildx imagetools inspect \
-  ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2
+  ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3
 ```
 
 Record in the release or pull-request evidence:
@@ -211,14 +260,17 @@ Record in the release or pull-request evidence:
 - the OCI index digest;
 - the `linux/amd64` manifest digest;
 - the `linux/arm64` manifest digest;
+- the config digest for each platform manifest;
 - confirmation that no moving tags were published.
 
-Pull and smoke-test the published image on each available native platform. Confirm its OCI labels identify the source repository, source revision, base image, and exact Codex version.
+Pull and smoke-test the exact published index digest on each available native platform. Confirm its OCI labels identify the source repository, source revision, base image, exact Codex version, exact Docker packages, and apt-key checksum. Anonymous inspection and pull must work without registry credentials.
+
+Docker build contexts are sent from the devbox client to the Mac engine. Bind mounts are different: the daemon resolves their source paths on the Mac, so a Compose entry such as `.:/app` does not mount the devbox's `/workspaces` directory. Build the content into an image, synchronize it to the Mac, or use another explicit remote-development workflow.
 
 ## Rollback and failed releases
 
 - Roll back a consumer by selecting an older known-good immutable tag or, preferably, its recorded digest.
 - Never delete or overwrite the defective tag as part of normal remediation.
-- When Codex remains `0.149.0`, fix a defect in `r2` and release `codex-0.149.0-r3`; continue incrementing the revision for later packaging fixes.
+- When Codex remains `0.149.0`, fix a defect in `r3` with a new `codex-0.149.0-r4`; continue incrementing the revision for later packaging fixes.
 - If a workflow cannot prove whether the target tag exists, stop. Resolve registry authentication or availability and rerun the complete publish workflow.
 - If publication partially succeeds, inspect the registry before retrying. Any existing target tag requires a new revision.

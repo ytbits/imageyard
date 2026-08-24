@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2}"
+image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3}"
 expected_codex_version="${EXPECTED_CODEX_VERSION:-0.149.0}"
+expected_docker_ce_cli_version="${EXPECTED_DOCKER_CLI_PACKAGE_VERSION:-5:29.7.2-1~debian.12~bookworm}"
+expected_docker_buildx_version="${EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION:-0.36.1-1~debian.12~bookworm}"
+expected_docker_compose_version="${EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION:-5.5.0-1~debian.12~bookworm}"
+expected_docker_cli_semver="${EXPECTED_DOCKER_CLI_SEMVER:-29.7.2}"
+expected_docker_buildx_semver="${EXPECTED_DOCKER_BUILDX_SEMVER:-0.36.1}"
+expected_docker_compose_semver="${EXPECTED_DOCKER_COMPOSE_SEMVER:-5.5.0}"
 secret_marker="IMAGEYARD_SMOKE_SECRET_DO_NOT_BAKE_7e4fdd65"
+docker_secret_marker="IMAGEYARD_DOCKER_HOST_SECRET_DO_NOT_PERSIST_903ea3d1"
 state_marker="IMAGEYARD_SMOKE_STATE_PERSISTS_b91c6c82"
+docker_host_alias="docker-host"
+docker_host_hostname="192.0.2.1"
+docker_host_port="2222"
+docker_host_user="imageyard"
+docker_host_uri="ssh://docker-host/Users/imageyard/.docker/run/docker.sock"
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-remote-devbox-smoke.XXXXXX")"
 fixture_token="${fixture_dir##*.}"
 name_prefix="codex-remote-devbox-smoke-$$-${fixture_token}"
@@ -70,6 +82,8 @@ declare -a cleanup_containers=(
 )
 declare -a cleanup_volumes=()
 declare -a secret_source_files=()
+declare -a docker_host_source_files=()
+declare -a sensitive_docker_host_files=()
 forward_pid=""
 signal_session_pid=""
 
@@ -127,6 +141,10 @@ trap 'exit 143' TERM
 
 [ "$state_marker" != "$secret_marker" ] \
   || fail "state and secret markers must be distinct"
+[ "$state_marker" != "$docker_secret_marker" ] \
+  || fail "state and Docker host secret markers must be distinct"
+[ "$secret_marker" != "$docker_secret_marker" ] \
+  || fail "SSH and Docker host secret markers must be distinct"
 
 for command_name in cksum cmp docker ssh ssh-keygen ssh-keyscan stat; do
   command -v "$command_name" >/dev/null 2>&1 \
@@ -136,7 +154,7 @@ done
 docker image inspect "$image" >/dev/null 2>&1 \
   || fail "image is not available locally: $image"
 
-mkdir -p "$fixture_dir/access" "$fixture_dir/host"
+mkdir -p "$fixture_dir/access" "$fixture_dir/host" "$fixture_dir/docker-host"
 
 ssh-keygen -q -t ed25519 -N '' -C "$secret_marker" -f "$fixture_dir/client_key"
 ssh-keygen -q -t ed25519 -N '' -C unknown-smoke-client -f "$fixture_dir/unknown_key"
@@ -151,6 +169,88 @@ printf 'ssh-ed25519 AAAA %s\n' "$secret_marker" \
   >> "$fixture_dir/mixed_invalid_authorized_keys"
 printf '%s\n' 'not-a-private-key' > "$fixture_dir/invalid_host_key"
 
+ssh-keygen -q -t ed25519 -N '' -C "$docker_secret_marker" \
+  -f "$fixture_dir/docker_client_key"
+ssh-keygen -q -t ed25519 -N '' -C docker-host-smoke-server \
+  -f "$fixture_dir/docker_remote_host_key"
+ssh-keygen -q -t ed25519 -N '' -C alternate-docker-client \
+  -f "$fixture_dir/alternate_docker_client_key"
+ssh-keygen -q -t ed25519 -N '' -C alternate-docker-host \
+  -f "$fixture_dir/alternate_docker_remote_host_key"
+ssh-keygen -q -t rsa -b 2048 -N '' -C wrong-client-key-type \
+  -f "$fixture_dir/rsa_docker_client_key"
+ssh-keygen -q -t rsa -b 2048 -N '' -C wrong-host-key-type \
+  -f "$fixture_dir/rsa_docker_remote_host_key"
+
+docker_client_fingerprint="$(
+  ssh-keygen -E sha256 -lf "$fixture_dir/docker_client_key.pub" \
+    | awk 'NR == 1 { print $2 }'
+)"
+docker_remote_host_fingerprint="$(
+  ssh-keygen -E sha256 -lf "$fixture_dir/docker_remote_host_key.pub" \
+    | awk 'NR == 1 { print $2 }'
+)"
+alternate_docker_client_fingerprint="$(
+  ssh-keygen -E sha256 -lf "$fixture_dir/alternate_docker_client_key.pub" \
+    | awk 'NR == 1 { print $2 }'
+)"
+alternate_docker_remote_host_fingerprint="$(
+  ssh-keygen -E sha256 -lf "$fixture_dir/alternate_docker_remote_host_key.pub" \
+    | awk 'NR == 1 { print $2 }'
+)"
+[ -n "$docker_client_fingerprint" ] \
+  || fail "could not derive the Docker host client fingerprint fixture"
+[ -n "$docker_remote_host_fingerprint" ] \
+  || fail "could not derive the Docker host fingerprint fixture"
+
+docker_client_public_key_material="$(
+  awk 'NR == 1 { print $1 " " $2 }' "$fixture_dir/docker_client_key.pub"
+)"
+docker_remote_host_public_key_material="$(
+  awk 'NR == 1 { print $1 " " $2 }' "$fixture_dir/docker_remote_host_key.pub"
+)"
+alternate_docker_remote_host_key_blob="$(
+  awk 'NR == 1 { print $2 }' "$fixture_dir/alternate_docker_remote_host_key.pub"
+)"
+rsa_docker_remote_host_key_blob="$(
+  awk 'NR == 1 { print $2 }' "$fixture_dir/rsa_docker_remote_host_key.pub"
+)"
+[ -n "$docker_client_public_key_material" ] \
+  || fail "could not derive the Docker host client public key fixture"
+[ -n "$docker_remote_host_public_key_material" ] \
+  || fail "could not derive the Docker host public key fixture"
+
+cp "$fixture_dir/docker_client_key" \
+  "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
+printf '%s\n' "$docker_host_uri" \
+  > "$fixture_dir/docker-host/docker_host"
+printf '%s\n' "$docker_host_alias" \
+  > "$fixture_dir/docker-host/ssh_alias"
+printf '%s\n' "$docker_host_hostname" \
+  > "$fixture_dir/docker-host/ssh_host"
+printf '%s\n' "$docker_host_port" \
+  > "$fixture_dir/docker-host/ssh_port"
+printf '%s\n' "$docker_host_user" \
+  > "$fixture_dir/docker-host/ssh_user"
+printf '%s\n' "$docker_client_fingerprint" \
+  > "$fixture_dir/docker-host/ssh_client_ed25519_fingerprint"
+printf '%s\n' "$docker_remote_host_fingerprint" \
+  > "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint"
+printf '%s %s\n' \
+  "$docker_host_alias" \
+  "$docker_remote_host_public_key_material" \
+  > "$fixture_dir/docker-host/ssh_known_hosts"
+chmod 0400 "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
+chmod 0444 \
+  "$fixture_dir/docker-host/docker_host" \
+  "$fixture_dir/docker-host/ssh_alias" \
+  "$fixture_dir/docker-host/ssh_host" \
+  "$fixture_dir/docker-host/ssh_port" \
+  "$fixture_dir/docker-host/ssh_user" \
+  "$fixture_dir/docker-host/ssh_client_ed25519_fingerprint" \
+  "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint" \
+  "$fixture_dir/docker-host/ssh_known_hosts"
+
 secret_source_files=(
   "$fixture_dir/access/authorized_keys"
   "$fixture_dir/host/ssh_host_ed25519_key"
@@ -159,6 +259,24 @@ secret_source_files=(
   "$fixture_dir/mixed_invalid_authorized_keys"
   "$fixture_dir/client_key"
   "$fixture_dir/invalid_host_key"
+)
+docker_host_source_files=(
+  "$fixture_dir/docker-host/docker_host"
+  "$fixture_dir/docker-host/ssh_alias"
+  "$fixture_dir/docker-host/ssh_host"
+  "$fixture_dir/docker-host/ssh_port"
+  "$fixture_dir/docker-host/ssh_user"
+  "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
+  "$fixture_dir/docker-host/ssh_client_ed25519_fingerprint"
+  "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint"
+  "$fixture_dir/docker-host/ssh_known_hosts"
+)
+sensitive_docker_host_files=(
+  "$fixture_dir/docker-host/docker_host"
+  "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
+  "$fixture_dir/docker-host/ssh_client_ed25519_fingerprint"
+  "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint"
+  "$fixture_dir/docker-host/ssh_known_hosts"
 )
 authorized_key_material="$(awk 'NR == 1 { print $1 " " $2 }' "$fixture_dir/access/authorized_keys")"
 host_public_key_material="$(ssh-keygen -y -f "$fixture_dir/host/ssh_host_ed25519_key")"
@@ -169,7 +287,9 @@ record_secret_sources() {
   local source_file
   local source_metadata
 
-  for source_file in "${secret_source_files[@]}"; do
+  for source_file in \
+    "${secret_source_files[@]}" \
+    "${docker_host_source_files[@]}"; do
     cksum "$source_file"
     if source_metadata="$(stat -f '%u:%g:%Lp:%m' "$source_file" 2>/dev/null)"; then
       :
@@ -264,6 +384,46 @@ seed_state_volume() {
   fi
 }
 
+seed_legacy_home_ssh_config() {
+  local volume_name="$1"
+
+  if ! state_volume_run "$volume_name" '
+    set -eu
+    install -d -o 1000 -g 1000 -m 0700 /state/.ssh
+    printf "%s\n" \
+      "Host docker-mac" \
+      "  HostName legacy-home.invalid" \
+      "  User legacy-user" \
+      "  IdentityFile ~/.ssh/legacy-docker-mac" \
+      > /state/.ssh/config
+    chown 1000:1000 /state/.ssh/config
+    chmod 0600 /state/.ssh/config
+    touch -d @1700000000 /state/.ssh/config /state/.ssh
+  '; then
+    fail "could not seed the legacy Home SSH configuration"
+  fi
+}
+
+assert_legacy_home_ssh_config_preserved() {
+  local volume_name="$1"
+
+  if ! state_volume_run "$volume_name" '
+    set -eu
+    test "$(stat -c "%u:%g:%a:%Y" -- /state/.ssh)" = 1000:1000:700:1700000000
+    test "$(stat -c "%u:%g:%a:%Y" -- /state/.ssh/config)" = 1000:1000:600:1700000000
+    expected="$(printf "%s\n" \
+      "Host docker-mac" \
+      "  HostName legacy-home.invalid" \
+      "  User legacy-user" \
+      "  IdentityFile ~/.ssh/legacy-docker-mac")"
+    test "$(cat /state/.ssh/config)" = "$expected"
+    test ! -e /state/.ssh/ssh_client_ed25519_private_key
+    test ! -e /state/.ssh/ssh_known_hosts
+  '; then
+    fail "legacy Home SSH configuration changed"
+  fi
+}
+
 assert_seed_preserved() {
   local volume_name="$1"
   local label="$2"
@@ -352,7 +512,7 @@ assert_state_excludes_secret_marker() {
 
   if ! state_volume_run "$volume_name" '
     set -eu
-    for forbidden_material in "$1" "$2" "$3" "-----BEGIN OPENSSH PRIVATE KEY-----"; do
+    for forbidden_material in "$@" "-----BEGIN OPENSSH PRIVATE KEY-----"; do
       grep_status=0
       grep -r -F -q -- "$forbidden_material" /state 2>/dev/null || grep_status=$?
       case "$grep_status" in
@@ -361,8 +521,17 @@ assert_state_excludes_secret_marker() {
         *) exit 2 ;;
       esac
     done
-  ' "$secret_marker" "$authorized_key_material" "$host_public_key_material"; then
-    fail "state volume $volume_name contains runtime SSH key material"
+  ' \
+    "$secret_marker" \
+    "$docker_secret_marker" \
+    "$authorized_key_material" \
+    "$host_public_key_material" \
+    "$docker_client_public_key_material" \
+    "$docker_remote_host_public_key_material" \
+    "$docker_client_fingerprint" \
+    "$docker_remote_host_fingerprint" \
+    "$docker_host_uri"; then
+    fail "state volume $volume_name contains runtime SSH or Docker host material"
   fi
 }
 
@@ -391,6 +560,7 @@ fi
 
 seed_state_volume "$home_volume" home 123:456 321:654 home-seed-content
 seed_state_volume "$workspace_volume" workspaces 234:567 432:765 workspace-seed-content
+seed_legacy_home_ssh_config "$home_volume"
 seed_state_volume "$invalid_secret_home_volume" invalid-home 345:678 543:876 invalid-home-seed
 seed_state_volume "$invalid_secret_workspace_volume" invalid-workspaces 456:789 654:987 invalid-workspace-seed
 
@@ -402,8 +572,11 @@ start_container() {
   docker run --detach \
     --name "$container_name" \
     --publish 127.0.0.1::2222 \
+    --env DOCKER_HOST=ssh://wrong-parent-environment/should-not-reach-ssh-sessions.sock \
+    --env DOCKER_CONTEXT=wrong-parent-context \
     --mount "type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
     --mount "type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
+    --mount "type=bind,src=$fixture_dir/docker-host,dst=/run/secrets/docker-host,readonly" \
     --mount "type=volume,src=$container_home_volume,dst=/home/codex,volume-nocopy" \
     --mount "type=volume,src=$container_workspace_volume,dst=/workspaces,volume-nocopy" \
     "$image" >/dev/null
@@ -463,8 +636,14 @@ assert_log_excludes_key_material() {
 
   for forbidden_material in \
     "$secret_marker" \
+    "$docker_secret_marker" \
     "$authorized_key_material" \
-    "$host_public_key_material"; do
+    "$host_public_key_material" \
+    "$docker_client_public_key_material" \
+    "$docker_remote_host_public_key_material" \
+    "$docker_client_fingerprint" \
+    "$docker_remote_host_fingerprint" \
+    "$docker_host_uri"; do
     grep_status=0
     grep -Fq -- "$forbidden_material" "$log_file" >/dev/null 2>&1 || grep_status=$?
     case "$grep_status" in
@@ -482,6 +661,17 @@ assert_log_excludes_key_material() {
       0) fail "log contains runtime key fixture material: $log_file" ;;
       1) ;;
       *) fail "could not scan log for runtime key fixture material: $log_file" ;;
+    esac
+  done
+
+  for source_file in "${sensitive_docker_host_files[@]}"; do
+    [ -s "$source_file" ] || continue
+    grep_status=0
+    grep -F -f "$source_file" "$log_file" >/dev/null 2>&1 || grep_status=$?
+    case "$grep_status" in
+      0) fail "log contains Docker host fixture material: $log_file" ;;
+      1) ;;
+      *) fail "could not scan log for Docker host fixture material: $log_file" ;;
     esac
   done
 }
@@ -521,9 +711,16 @@ expect_start_failure() {
   local container_name="$1"
   local log_file="$2"
   local expected_log="$3"
+  local docker_bundle_mount
   shift 3
 
-  if ! docker run --detach --name "$container_name" "$@" "$image" \
+  docker_bundle_mount="${docker_host_failure_mount:-type=bind,src=$fixture_dir/docker-host,dst=/run/secrets/docker-host,readonly}"
+
+  if ! docker run --detach \
+    --name "$container_name" \
+    --mount "$docker_bundle_mount" \
+    "$@" \
+    "$image" \
     > /dev/null 2>"$log_file"; then
     fail "Docker could not create $container_name"
   fi
@@ -539,6 +736,7 @@ expect_state_type_failure() {
   shift 4
   local expected_log
   local wrapper
+  local docker_bundle_mount
 
   case "$state_type" in
     missing)
@@ -558,8 +756,11 @@ expect_state_type_failure() {
       ;;
   esac
 
+  docker_bundle_mount="${docker_host_failure_mount:-type=bind,src=$fixture_dir/docker-host,dst=/run/secrets/docker-host,readonly}"
+
   if ! docker run --detach \
     --name "$container_name" \
+    --mount "$docker_bundle_mount" \
     "$@" \
     --entrypoint /bin/sh \
     "$image" \
@@ -569,6 +770,79 @@ expect_state_type_failure() {
   fi
 
   wait_for_start_failure "$container_name" "$log_file" "$expected_log"
+}
+
+copy_docker_host_bundle_fixture() {
+  local fixture_name="$1"
+  local destination="$fixture_dir/docker-host-$fixture_name"
+
+  mkdir -p "$destination"
+  cp -a "$fixture_dir/docker-host/." "$destination/"
+  printf '%s\n' "$destination"
+}
+
+write_docker_host_fixture_field() {
+  local bundle_dir="$1"
+  local field_name="$2"
+  local field_value="$3"
+  local field_mode=0444
+
+  if [ "$field_name" = ssh_client_ed25519_private_key ]; then
+    field_mode=0400
+  fi
+  chmod u+w "$bundle_dir/$field_name"
+  printf '%s\n' "$field_value" > "$bundle_dir/$field_name"
+  chmod "$field_mode" "$bundle_dir/$field_name"
+}
+
+copy_docker_host_fixture_private_key() {
+  local bundle_dir="$1"
+  local source_key="$2"
+
+  chmod u+w "$bundle_dir/ssh_client_ed25519_private_key"
+  cp "$source_key" "$bundle_dir/ssh_client_ed25519_private_key"
+  chmod 0400 "$bundle_dir/ssh_client_ed25519_private_key"
+}
+
+expect_docker_host_bundle_failure() {
+  local fixture_name="$1"
+  local bundle_dir="$2"
+  local expected_log="$3"
+  local container_name="${name_prefix}-docker-${fixture_name}"
+  local log_file="$fixture_dir/docker-${fixture_name}.log"
+
+  cleanup_containers+=("$container_name")
+  docker_host_failure_mount="type=bind,src=$bundle_dir,dst=/run/secrets/docker-host,readonly" \
+    expect_start_failure \
+      "$container_name" \
+      "$log_file" \
+      "$expected_log" \
+      --network none \
+      --mount "type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
+      --mount "type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
+      --mount "type=volume,src=$support_home_volume,dst=/home/codex,volume-nocopy" \
+      --mount "type=volume,src=$support_workspace_volume,dst=/workspaces,volume-nocopy"
+
+  local sensitive_name
+  local grep_status
+  for sensitive_name in \
+    docker_host \
+    ssh_client_ed25519_private_key \
+    ssh_client_ed25519_fingerprint \
+    ssh_host_ed25519_fingerprint \
+    ssh_known_hosts; do
+    [ -f "$bundle_dir/$sensitive_name" ] || continue
+    [ ! -L "$bundle_dir/$sensitive_name" ] || continue
+    [ -s "$bundle_dir/$sensitive_name" ] || continue
+    grep_status=0
+    grep -F -f "$bundle_dir/$sensitive_name" "$log_file" >/dev/null 2>&1 \
+      || grep_status=$?
+    case "$grep_status" in
+      0) fail "$container_name printed Docker host Secret material" ;;
+      1) ;;
+      *) fail "could not scan $container_name logs for Docker host Secret material" ;;
+    esac
+  done
 }
 
 assert_container_state_contract() {
@@ -589,19 +863,26 @@ assert_container_state_contract() {
 }
 
 docker image inspect "$image" > "$fixture_dir/image-inspect.json"
-if grep -Fq "$secret_marker" "$fixture_dir/image-inspect.json"; then
+if grep -Fq "$secret_marker" "$fixture_dir/image-inspect.json" \
+  || grep -Fq "$docker_secret_marker" "$fixture_dir/image-inspect.json"; then
   fail "image metadata contains the smoke-test secret marker"
 fi
+if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
+  | grep -E '^DOCKER_(HOST|CONTEXT)=' >/dev/null; then
+  fail "image metadata sets DOCKER_HOST or DOCKER_CONTEXT"
+fi
 docker history --no-trunc "$image" > "$fixture_dir/image-history.txt"
-if grep -Fq "$secret_marker" "$fixture_dir/image-history.txt"; then
+if grep -Fq "$secret_marker" "$fixture_dir/image-history.txt" \
+  || grep -Fq "$docker_secret_marker" "$fixture_dir/image-history.txt"; then
   fail "image history contains the smoke-test secret marker"
 fi
 
 docker create --name "$audit_container" --entrypoint /bin/sh "$image" -c true >/dev/null
 docker export "$audit_container" > "$fixture_dir/rootfs.tar"
 tar -tf "$fixture_dir/rootfs.tar" > "$fixture_dir/rootfs.list"
-if grep -E '(^|/)ssh_host_[^/]*_key$|(^|/)authorized_keys$' "$fixture_dir/rootfs.list" >/dev/null; then
-  fail "image filesystem contains an SSH host or authorized key"
+if grep -E '(^|/)(ssh_host_[^/]*_key|authorized_keys|ssh_client_ed25519_private_key|ssh_known_hosts)$' \
+  "$fixture_dir/rootfs.list" >/dev/null; then
+  fail "image filesystem contains a runtime SSH key or pin"
 fi
 if ! docker run --rm \
   --name "$filesystem_audit_container" \
@@ -611,13 +892,15 @@ if ! docker run --rm \
     set -eu
     test ! -e /home/codex/.codex/auth.json
     test ! -e /home/codex/.config/gh/hosts.yml
-    if find /etc/ssh /home/codex /root -type f -exec grep -I -l -E "^-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----" {} + 2>/dev/null | grep -q .; then
+    if find /etc/ssh /home/codex /root /run -type f -exec grep -I -l -E "^-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----" {} + 2>/dev/null | grep -q .; then
       exit 1
     fi
-    if grep -R -F -l "$1" /etc /home /root /usr/local 2>/dev/null | grep -q .; then
-      exit 1
-    fi
-  ' sh "$secret_marker"; then
+    for forbidden_material in "$1" "$2"; do
+      if grep -R -F -l "$forbidden_material" /etc /home /root /run /usr/local 2>/dev/null | grep -q .; then
+        exit 1
+      fi
+    done
+  ' sh "$secret_marker" "$docker_secret_marker"; then
   fail "image filesystem contains credential material or the smoke-test marker"
 fi
 
@@ -638,22 +921,25 @@ primary_fingerprint="$(ssh-keygen -E sha256 -lf "$primary_known_hosts" | awk 'NR
   || fail "image exposes a port other than TCP 2222"
 
 actual_mounts="$(docker inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$primary_container" | sed '/^$/d' | sort)"
-expected_mounts="$(printf '%s\n' /home/codex /run/secrets/ssh-access/authorized_keys /run/secrets/ssh-host/ssh_host_ed25519_key /workspaces | sort)"
+expected_mounts="$(printf '%s\n' /home/codex /run/secrets/docker-host /run/secrets/ssh-access/authorized_keys /run/secrets/ssh-host/ssh_host_ed25519_key /workspaces | sort)"
 [ "$actual_mounts" = "$expected_mounts" ] \
   || fail "container uses unexpected mounts: $(printf '%s' "$actual_mounts" | paste -sd, -)"
 [ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/codex"}}{{.Type}}:{{.Name}}{{end}}{{end}}' "$primary_container")" = "volume:$home_volume" ] \
   || fail "home state is not backed by the expected named volume"
 [ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/workspaces"}}{{.Type}}:{{.Name}}{{end}}{{end}}' "$primary_container")" = "volume:$workspace_volume" ] \
   || fail "workspace state is not backed by the expected named volume"
+[ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/docker-host"}}{{.Type}}:{{.RW}}{{end}}{{end}}' "$primary_container")" = bind:false ] \
+  || fail "Docker host Secret is not a read-only bind mount"
 
 assert_container_state_contract "$primary_container"
 assert_volume_root_metadata "$home_volume" 1000:1000:700
 assert_volume_root_metadata "$workspace_volume" 1000:1000:700
 assert_seed_preserved "$home_volume" home 123:456 321:654 home-seed-content
 assert_seed_preserved "$workspace_volume" workspaces 234:567 432:765 workspace-seed-content
+assert_legacy_home_ssh_config_preserved "$home_volume"
 assert_no_probe_leftovers "$home_volume"
 assert_no_probe_leftovers "$workspace_volume"
-assert_volume_top_level_entries "$home_volume" seed-home
+assert_volume_top_level_entries "$home_volume" .ssh seed-home
 assert_volume_top_level_entries "$workspace_volume" seed-workspaces
 
 docker exec "$primary_container" /bin/sh -c '
@@ -663,12 +949,110 @@ docker exec "$primary_container" /bin/sh -c '
   sshd_pid="$(pgrep -o -x sshd)"
   test -n "$sshd_pid"
   test "$(ps -o user= -p "$sshd_pid" | tr -d " ")" = root
-  test ! -S /var/run/docker.sock
+  sshd_cmdline="$(tr "\000" " " < "/proc/$sshd_pid/cmdline")"
+  case "$sshd_cmdline" in
+    *"-f /run/codex-remote-devbox/sshd_config"*) ;;
+    *) exit 1 ;;
+  esac
+  for forbidden_socket in \
+    /run/docker.sock \
+    /var/run/docker.sock \
+    /run/containerd/containerd.sock \
+    /var/run/containerd/containerd.sock; do
+    test ! -S "$forbidden_socket"
+  done
+  for forbidden_process in dockerd containerd containerd-shim podman conmon nerdctl; do
+    if pgrep -x "$forbidden_process" >/dev/null 2>&1; then
+      exit 1
+    fi
+  done
 '
+
+docker exec "$primary_container" /bin/sh -c '
+  set -eu
+  source_dir=/run/secrets/docker-host
+  runtime_dir=/run/codex-remote-devbox/docker-host
+  client_key=ssh_client_ed25519_private_key
+  known_hosts=ssh_known_hosts
+
+  test -d "$source_dir"
+  test ! -L "$source_dir"
+  awk -v expected="$source_dir" '\''
+    $5 == expected && $6 ~ /(^|,)ro(,|$)/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '\'' /proc/self/mountinfo
+  for source_name in \
+    docker_host \
+    ssh_alias \
+    ssh_host \
+    ssh_port \
+    ssh_user \
+    ssh_client_ed25519_private_key \
+    ssh_client_ed25519_fingerprint \
+    ssh_host_ed25519_fingerprint \
+    ssh_known_hosts; do
+    source_file="$source_dir/$source_name"
+    test -f "$source_file"
+    test ! -L "$source_file"
+    test -s "$source_file"
+    expected_mode=444
+    if test "$source_name" = "$client_key"; then
+      expected_mode=400
+    fi
+    test "$(stat -c "%a" -- "$source_file")" = "$expected_mode"
+    if sudo -n -u codex -- test -w "$source_file"; then
+      exit 1
+    fi
+  done
+
+  test -f "$runtime_dir/$client_key"
+  test ! -L "$runtime_dir/$client_key"
+  test -f "$runtime_dir/$known_hosts"
+  test ! -L "$runtime_dir/$known_hosts"
+  test "$(stat -c "%u:%g:%a" -- "$runtime_dir/$client_key")" = 1000:1000:600
+  test "$(stat -c "%u:%g:%a" -- "$runtime_dir/$known_hosts")" = 1000:1000:600
+  cmp "$source_dir/$client_key" "$runtime_dir/$client_key"
+  cmp "$source_dir/$known_hosts" "$runtime_dir/$known_hosts"
+  test "$(stat -c "%u:%g:%a" -- /etc/ssh/ssh_config.d/20-codex-docker-host.conf)" = 0:0:644
+  test "$(stat -c "%u:%g:%a" -- /run/codex-remote-devbox/sshd_config)" = 0:0:600
+
+  client_config=/etc/ssh/ssh_config.d/20-codex-docker-host.conf
+  test "$(grep -Ec "^Host[[:space:]]+docker-host$" "$client_config")" = 1
+  test "$(grep -Ec "^Host[[:space:]]" "$client_config")" = 1
+  grep -Fxq "  HostKeyAlias docker-host" "$client_config"
+  effective="$(sudo -n -u codex -- ssh -G docker-host 2>/dev/null)"
+  has_setting() {
+    printf "%s\n" "$effective" | grep -Fxq -- "$1"
+  }
+  has_setting "host docker-host"
+  has_setting "hostname $1"
+  has_setting "user $2"
+  has_setting "port $3"
+  has_setting "identityfile $runtime_dir/$client_key"
+  has_setting "identitiesonly yes"
+  has_setting "batchmode yes"
+  has_setting "preferredauthentications publickey"
+  has_setting "passwordauthentication no"
+  has_setting "kbdinteractiveauthentication no"
+  has_setting "stricthostkeychecking true"
+  has_setting "userknownhostsfile $runtime_dir/$known_hosts"
+  has_setting "hostkeyalgorithms ssh-ed25519"
+  has_setting "hostkeyalias docker-host"
+  has_setting "updatehostkeys false"
+  has_setting "forwardagent no"
+
+  grep -Fxq "SetEnv DOCKER_HOST=$4" /run/codex-remote-devbox/sshd_config
+  /usr/sbin/sshd -t -f /run/codex-remote-devbox/sshd_config
+' sh \
+  "$docker_host_hostname" \
+  "$docker_host_user" \
+  "$docker_host_port" \
+  "$docker_host_uri"
 
 clean_stdout="$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   "printf '%s' codex-smoke-output" 2>"$fixture_dir/ssh.stderr")"
 [ "$clean_stdout" = codex-smoke-output ] || fail "noninteractive SSH stdout contains a banner or MOTD"
+assert_log_excludes_key_material "$fixture_dir/ssh.stderr"
 
 [ "$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex 'id -u')" = 1000 ] \
   || fail "SSH session UID is not 1000"
@@ -681,6 +1065,56 @@ clean_stdout="$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir
   || fail "passwordless sudo is unavailable"
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  "set -eu; test \"\${DOCKER_HOST-}\" = '$docker_host_uri'; test -z \"\${DOCKER_CONTEXT+x}\"" \
+  || fail "command SSH session did not receive only the validated DOCKER_HOST"
+
+interactive_probe_output="$fixture_dir/interactive-docker-env.stdout"
+interactive_probe_error="$fixture_dir/interactive-docker-env.stderr"
+if ! {
+  printf '%s\n' \
+    'export HISTFILE=/dev/null' \
+    'set -eu' \
+    'test -n "${DOCKER_HOST-}"' \
+    'case "$DOCKER_HOST" in ssh://docker-host/*) ;; *) false ;; esac' \
+    'test -z "${DOCKER_CONTEXT+x}"' \
+    'printf "%s\\n" docker-env-interactive-ok' \
+    'exit'
+} | ssh \
+  -F /dev/null \
+  -tt \
+  -p "$primary_port" \
+  -i "$fixture_dir/client_key" \
+  -o BatchMode=yes \
+  -o ConnectTimeout=5 \
+  -o IdentitiesOnly=yes \
+  -o LogLevel=ERROR \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$primary_known_hosts" \
+  codex@127.0.0.1 \
+  >"$interactive_probe_output" 2>"$interactive_probe_error"; then
+  fail "interactive SSH session could not validate the Docker environment"
+fi
+grep -Fq docker-env-interactive-ok "$interactive_probe_output" \
+  || fail "interactive SSH session did not receive DOCKER_HOST"
+assert_log_excludes_key_material "$interactive_probe_output"
+assert_log_excludes_key_material "$interactive_probe_error"
+if grep -Fq wrong-parent-context "$interactive_probe_output" \
+  || grep -Fq wrong-parent-context "$interactive_probe_error"; then
+  fail "interactive SSH session inherited DOCKER_CONTEXT"
+fi
+
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
+  set -eu
+  if timeout --signal=KILL 5 docker info >/dev/null 2>&1; then
+    exit 1
+  fi
+  test -n "${DOCKER_HOST-}"
+  test -z "${DOCKER_CONTEXT+x}"
+' || fail "offline Docker host behavior violated the SSH session contract"
+[ "$(docker inspect --format '{{.State.Running}}' "$primary_container")" = true ] \
+  || fail "an unreachable Docker host stopped the devbox"
+
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   "set -eu; test -w /home/codex; test -w /workspaces; printf '%s' '$state_marker' > /home/codex/.imageyard-smoke-state; printf '%s' '$state_marker' > /workspaces/.imageyard-smoke-state"
 
 [ "$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex 'codex --version')" = "codex-cli $expected_codex_version" ] \
@@ -690,17 +1124,73 @@ ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" cod
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
   set -eu
-  for required_command in node npm python3 pip3 git git-lfs gh ssh gcc make curl jq rg fd bwrap ip ss ping lsof nc strace sudo tini; do
+  for required_command in node npm python3 pip3 git git-lfs gh ssh docker gcc make curl jq rg fd bwrap ip ss ping lsof nc strace sudo tini; do
     command -v "$required_command" >/dev/null
   done
+  docker --version >/dev/null
+  docker buildx version >/dev/null
+  docker compose version >/dev/null
   python3 -m venv /tmp/imageyard-venv-smoke
   rm -rf /tmp/imageyard-venv-smoke
-  for forbidden_command in docker dockerd podman nerdctl kubectl helm flux terraform tofu oras crane skopeo nvm pyenv; do
+  for forbidden_command in dockerd containerd containerd-shim ctr podman nerdctl kubectl helm flux terraform tofu oras crane skopeo nvm pyenv; do
     if command -v "$forbidden_command" >/dev/null 2>&1; then
       exit 1
     fi
   done
 '
+
+docker exec "$primary_container" /bin/sh -c '
+  set -eu
+  package_version() {
+    dpkg-query -W "$1" | awk "NR == 1 { print \$2 }"
+  }
+  test "$(package_version docker-ce-cli)" = "$1"
+  test "$(package_version docker-buildx-plugin)" = "$2"
+  test "$(package_version docker-compose-plugin)" = "$3"
+  docker_cli_semver="$(docker --version | awk "NR == 1 { gsub(/,/, \"\", \$3); print \$3 }")"
+  docker_buildx_semver="$(docker buildx version | awk "NR == 1 { sub(/^v/, \"\", \$2); print \$2 }")"
+  docker_compose_semver="$(docker compose version --short | awk "NR == 1 { sub(/^v/, \"\", \$1); print \$1 }")"
+  test "$docker_cli_semver" = "$4"
+  test "$docker_buildx_semver" = "$5"
+  test "$docker_compose_semver" = "$6"
+  for forbidden_package in \
+    docker-ce \
+    docker-ce-rootless-extras \
+    docker.io \
+    docker-compose \
+    containerd \
+    containerd.io \
+    podman; do
+    if dpkg-query -s "$forbidden_package" 2>/dev/null \
+      | grep -Fxq "Status: install ok installed"; then
+      exit 1
+    fi
+  done
+' sh \
+  "$expected_docker_ce_cli_version" \
+  "$expected_docker_buildx_version" \
+  "$expected_docker_compose_version" \
+  "$expected_docker_cli_semver" \
+  "$expected_docker_buildx_semver" \
+  "$expected_docker_compose_semver"
+
+native_architecture="$(
+  ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+    'dpkg --print-architecture'
+)"
+case "$native_architecture" in
+  amd64|arm64) ;;
+  *) fail "unsupported native package architecture: $native_architecture" ;;
+esac
+[ "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$native_architecture" ] \
+  || fail "image architecture does not match its installed package architecture"
+engine_architecture="$(docker info --format '{{.Architecture}}')"
+case "$engine_architecture" in
+  x86_64) engine_architecture=amd64 ;;
+  aarch64) engine_architecture=arm64 ;;
+esac
+[ "$engine_architecture" = "$native_architecture" ] \
+  || fail "smoke test is not running on the image's native architecture"
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
   set -eu
@@ -712,25 +1202,28 @@ ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" cod
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   'if pgrep -x codex >/dev/null 2>&1; then exit 1; fi'
 
-effective_sshd="$fixture_dir/sshd.effective"
-docker exec "$primary_container" /usr/sbin/sshd -T -f /etc/ssh/sshd_config > "$effective_sshd"
-for expected_setting in \
-  'port 2222' \
-  'permitrootlogin no' \
-  'passwordauthentication no' \
-  'kbdinteractiveauthentication no' \
-  'allowagentforwarding no' \
-  'allowtcpforwarding local' \
-  'allowstreamlocalforwarding no' \
-  'x11forwarding no' \
-  'permituserenvironment no' \
-  'printmotd no' \
-  'banner none'; do
-  grep -Fxq "$expected_setting" "$effective_sshd" \
-    || fail "effective sshd configuration is missing: $expected_setting"
-done
-grep -Fq '127.0.0.1:*' "$effective_sshd" || fail "local forwarding is not restricted to loopback"
-grep -Fq 'localhost:*' "$effective_sshd" || fail "localhost forwarding is not permitted"
+docker exec "$primary_container" /bin/sh -c '
+  set -eu
+  effective="$(/usr/sbin/sshd -T -f /run/codex-remote-devbox/sshd_config)"
+  for expected_setting in \
+    "port 2222" \
+    "permitrootlogin no" \
+    "passwordauthentication no" \
+    "kbdinteractiveauthentication no" \
+    "allowagentforwarding no" \
+    "allowtcpforwarding local" \
+    "allowstreamlocalforwarding no" \
+    "x11forwarding no" \
+    "permituserenvironment no" \
+    "printmotd no" \
+    "banner none" \
+    "setenv DOCKER_HOST=$1"; do
+    printf "%s\n" "$effective" | grep -Fxq "$expected_setting"
+  done
+  printf "%s\n" "$effective" | grep -Fq "127.0.0.1:*"
+  printf "%s\n" "$effective" | grep -Fq "localhost:*"
+' sh "$docker_host_uri" \
+  || fail "effective runtime sshd configuration violates the image contract"
 
 if ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/unknown_key" codex true \
   >/dev/null 2>&1; then
@@ -759,6 +1252,7 @@ grep -E 'Authentications that can continue: publickey[[:space:]]*$' "$password_p
 if grep -E 'Authentications that can continue:.*(password|keyboard-interactive)' "$password_probe_log" >/dev/null; then
   fail "server advertised password or keyboard-interactive authentication"
 fi
+assert_log_excludes_key_material "$password_probe_log"
 
 ssh \
   -F /dev/null \
@@ -852,10 +1346,11 @@ assert_volume_root_metadata "$home_volume" 1000:1000:700
 assert_volume_root_metadata "$workspace_volume" 1000:1000:700
 assert_seed_preserved "$home_volume" home 123:456 321:654 home-seed-content
 assert_seed_preserved "$workspace_volume" workspaces 234:567 432:765 workspace-seed-content
+assert_legacy_home_ssh_config_preserved "$home_volume"
 assert_no_probe_leftovers "$home_volume"
 assert_no_probe_leftovers "$workspace_volume"
 assert_volume_top_level_entries \
-  "$home_volume" .codex .imageyard-smoke-state seed-home
+  "$home_volume" .codex .imageyard-smoke-state .ssh seed-home
 assert_volume_top_level_entries \
   "$workspace_volume" .imageyard-smoke-state seed-workspaces
 
@@ -865,9 +1360,236 @@ assert_volume_top_level_entries \
 [ "$(ssh_command "$restart_known_hosts" "$restart_port" "$fixture_dir/client_key" codex \
   'cat /workspaces/.imageyard-smoke-state')" = "$state_marker" ] \
   || fail "workspace state did not persist across replacement"
+ssh_command "$restart_known_hosts" "$restart_port" "$fixture_dir/client_key" codex \
+  "set -eu; test \"\${DOCKER_HOST-}\" = '$docker_host_uri'; test -z \"\${DOCKER_CONTEXT+x}\"" \
+  || fail "replacement container did not restore the Docker SSH environment"
 
 valid_access_mount="type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly"
 valid_host_mount="type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly"
+
+docker_host_required_names=(
+  docker_host
+  ssh_alias
+  ssh_host
+  ssh_port
+  ssh_user
+  ssh_client_ed25519_private_key
+  ssh_client_ed25519_fingerprint
+  ssh_host_ed25519_fingerprint
+  ssh_known_hosts
+)
+for required_name in "${docker_host_required_names[@]}"; do
+  fixture_label="${required_name//_/-}"
+
+  missing_bundle="$(copy_docker_host_bundle_fixture "missing-$fixture_label")"
+  rm -f -- "$missing_bundle/$required_name"
+  expect_docker_host_bundle_failure \
+    "missing-$fixture_label" \
+    "$missing_bundle" \
+    'required Docker host Secret'
+
+  empty_bundle="$(copy_docker_host_bundle_fixture "empty-$fixture_label")"
+  chmod u+w "$empty_bundle/$required_name"
+  : > "$empty_bundle/$required_name"
+  if [ "$required_name" = ssh_client_ed25519_private_key ]; then
+    chmod 0400 "$empty_bundle/$required_name"
+  else
+    chmod 0444 "$empty_bundle/$required_name"
+  fi
+  expect_docker_host_bundle_failure \
+    "empty-$fixture_label" \
+    "$empty_bundle" \
+    'required Docker host Secret'
+
+  symlink_bundle="$(copy_docker_host_bundle_fixture "symlink-$fixture_label")"
+  rm -f -- "$symlink_bundle/$required_name"
+  symlink_target=ssh_alias
+  if [ "$required_name" = ssh_alias ]; then
+    symlink_target=docker_host
+  fi
+  ln -s "$symlink_target" "$symlink_bundle/$required_name"
+  expect_docker_host_bundle_failure \
+    "symlink-$fixture_label" \
+    "$symlink_bundle" \
+    'required Docker host Secret'
+
+  directory_bundle="$(copy_docker_host_bundle_fixture "directory-$fixture_label")"
+  rm -f -- "$directory_bundle/$required_name"
+  mkdir "$directory_bundle/$required_name"
+  expect_docker_host_bundle_failure \
+    "directory-$fixture_label" \
+    "$directory_bundle" \
+    'required Docker host Secret'
+done
+
+invalid_alias_bundle="$(copy_docker_host_bundle_fixture invalid-alias)"
+write_docker_host_fixture_field "$invalid_alias_bundle" ssh_alias other-alias
+expect_docker_host_bundle_failure \
+  invalid-alias \
+  "$invalid_alias_bundle" \
+  'Docker host SSH alias must be docker-host'
+
+for invalid_host_case in 'bad host' '/absolute/path' '-leading-option'; do
+  invalid_host_label="$(printf '%s' "$invalid_host_case" | cksum | awk '{ print $1 }')"
+  invalid_host_bundle="$(copy_docker_host_bundle_fixture "invalid-host-$invalid_host_label")"
+  write_docker_host_fixture_field "$invalid_host_bundle" ssh_host "$invalid_host_case"
+  expect_docker_host_bundle_failure \
+    "invalid-host-$invalid_host_label" \
+    "$invalid_host_bundle" \
+    'Docker host SSH hostname is invalid'
+done
+
+for invalid_port_case in 0 65536 22x; do
+  invalid_port_bundle="$(copy_docker_host_bundle_fixture "invalid-port-$invalid_port_case")"
+  write_docker_host_fixture_field "$invalid_port_bundle" ssh_port "$invalid_port_case"
+  expect_docker_host_bundle_failure \
+    "invalid-port-$invalid_port_case" \
+    "$invalid_port_bundle" \
+    'Docker host SSH port is invalid'
+done
+
+for invalid_user_case in 'bad user' '-leading-option' 'user/name'; do
+  invalid_user_label="$(printf '%s' "$invalid_user_case" | cksum | awk '{ print $1 }')"
+  invalid_user_bundle="$(copy_docker_host_bundle_fixture "invalid-user-$invalid_user_label")"
+  write_docker_host_fixture_field "$invalid_user_bundle" ssh_user "$invalid_user_case"
+  expect_docker_host_bundle_failure \
+    "invalid-user-$invalid_user_label" \
+    "$invalid_user_bundle" \
+    'Docker host SSH user is invalid'
+done
+
+invalid_uri_scheme_bundle="$(copy_docker_host_bundle_fixture invalid-uri-scheme)"
+write_docker_host_fixture_field \
+  "$invalid_uri_scheme_bundle" \
+  docker_host \
+  'tcp://docker-host:2375'
+expect_docker_host_bundle_failure \
+  invalid-uri-scheme \
+  "$invalid_uri_scheme_bundle" \
+  'Docker host URI is invalid'
+
+invalid_uri_alias_bundle="$(copy_docker_host_bundle_fixture invalid-uri-alias)"
+write_docker_host_fixture_field \
+  "$invalid_uri_alias_bundle" \
+  docker_host \
+  'ssh://other-alias/Users/imageyard/.docker/run/docker.sock'
+expect_docker_host_bundle_failure \
+  invalid-uri-alias \
+  "$invalid_uri_alias_bundle" \
+  'Docker host URI is invalid'
+
+invalid_uri_path_bundle="$(copy_docker_host_bundle_fixture invalid-uri-path)"
+write_docker_host_fixture_field \
+  "$invalid_uri_path_bundle" \
+  docker_host \
+  'ssh://docker-host'
+expect_docker_host_bundle_failure \
+  invalid-uri-path \
+  "$invalid_uri_path_bundle" \
+  'Docker host URI is invalid'
+
+invalid_client_key_bundle="$(copy_docker_host_bundle_fixture invalid-client-key)"
+write_docker_host_fixture_field \
+  "$invalid_client_key_bundle" \
+  ssh_client_ed25519_private_key \
+  "not-a-private-key-$docker_secret_marker"
+expect_docker_host_bundle_failure \
+  invalid-client-key \
+  "$invalid_client_key_bundle" \
+  'Docker host client key is not a valid Ed25519 private key'
+
+rsa_client_key_bundle="$(copy_docker_host_bundle_fixture rsa-client-key)"
+copy_docker_host_fixture_private_key \
+  "$rsa_client_key_bundle" \
+  "$fixture_dir/rsa_docker_client_key"
+expect_docker_host_bundle_failure \
+  rsa-client-key \
+  "$rsa_client_key_bundle" \
+  'Docker host client key is not a valid Ed25519 private key'
+
+client_fingerprint_mismatch_bundle="$(copy_docker_host_bundle_fixture client-fingerprint-mismatch)"
+write_docker_host_fixture_field \
+  "$client_fingerprint_mismatch_bundle" \
+  ssh_client_ed25519_fingerprint \
+  "$alternate_docker_client_fingerprint"
+expect_docker_host_bundle_failure \
+  client-fingerprint-mismatch \
+  "$client_fingerprint_mismatch_bundle" \
+  'Docker host client key fingerprint does not match'
+
+invalid_client_fingerprint_bundle="$(copy_docker_host_bundle_fixture invalid-client-fingerprint)"
+write_docker_host_fixture_field \
+  "$invalid_client_fingerprint_bundle" \
+  ssh_client_ed25519_fingerprint \
+  'SHA256:not-valid!'
+expect_docker_host_bundle_failure \
+  invalid-client-fingerprint \
+  "$invalid_client_fingerprint_bundle" \
+  'Docker host client key fingerprint is invalid'
+
+invalid_host_fingerprint_bundle="$(copy_docker_host_bundle_fixture invalid-host-fingerprint)"
+write_docker_host_fixture_field \
+  "$invalid_host_fingerprint_bundle" \
+  ssh_host_ed25519_fingerprint \
+  'SHA256:not-valid!'
+expect_docker_host_bundle_failure \
+  invalid-host-fingerprint \
+  "$invalid_host_fingerprint_bundle" \
+  'Docker host key fingerprint is invalid'
+
+known_hosts_endpoint_bundle="$(copy_docker_host_bundle_fixture known-hosts-endpoint)"
+write_docker_host_fixture_field \
+  "$known_hosts_endpoint_bundle" \
+  ssh_known_hosts \
+  "other-alias $docker_remote_host_public_key_material"
+expect_docker_host_bundle_failure \
+  known-hosts-endpoint \
+  "$known_hosts_endpoint_bundle" \
+  'Docker host known_hosts must contain exactly one matching Ed25519 entry'
+
+known_hosts_extra_bundle="$(copy_docker_host_bundle_fixture known-hosts-extra)"
+write_docker_host_fixture_field \
+  "$known_hosts_extra_bundle" \
+  ssh_known_hosts \
+  "$docker_host_alias $docker_remote_host_public_key_material
+other-alias $docker_remote_host_public_key_material"
+expect_docker_host_bundle_failure \
+  known-hosts-extra \
+  "$known_hosts_extra_bundle" \
+  'Docker host known_hosts must contain exactly one matching Ed25519 entry'
+
+known_hosts_rsa_bundle="$(copy_docker_host_bundle_fixture known-hosts-rsa)"
+write_docker_host_fixture_field \
+  "$known_hosts_rsa_bundle" \
+  ssh_known_hosts \
+  "$docker_host_alias ssh-rsa $rsa_docker_remote_host_key_blob"
+expect_docker_host_bundle_failure \
+  known-hosts-rsa \
+  "$known_hosts_rsa_bundle" \
+  'Docker host known_hosts must contain exactly one matching Ed25519 entry'
+
+known_hosts_key_mismatch_bundle="$(copy_docker_host_bundle_fixture known-hosts-key-mismatch)"
+write_docker_host_fixture_field \
+  "$known_hosts_key_mismatch_bundle" \
+  ssh_known_hosts \
+  "$docker_host_alias ssh-ed25519 $alternate_docker_remote_host_key_blob"
+expect_docker_host_bundle_failure \
+  known-hosts-key-mismatch \
+  "$known_hosts_key_mismatch_bundle" \
+  'Docker host known_hosts fingerprint does not match'
+
+host_fingerprint_mismatch_bundle="$(copy_docker_host_bundle_fixture host-fingerprint-mismatch)"
+write_docker_host_fixture_field \
+  "$host_fingerprint_mismatch_bundle" \
+  ssh_host_ed25519_fingerprint \
+  "$alternate_docker_remote_host_fingerprint"
+expect_docker_host_bundle_failure \
+  host-fingerprint-mismatch \
+  "$host_fingerprint_mismatch_bundle" \
+  'Docker host known_hosts fingerprint does not match'
+
+assert_volume_root_metadata "$support_home_volume" 0:0:755
+assert_volume_root_metadata "$support_workspace_volume" 0:0:755
 
 expect_start_failure "$missing_home_container" "$fixture_dir/missing-home.log" \
   'required state root is not an exact mountpoint: /home/codex' \

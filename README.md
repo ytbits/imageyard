@@ -44,7 +44,7 @@ imageyard/
 
 The `codex-remote-devbox/` directory defines an SSH-accessible development environment for Codex Desktop remote connections:
 
-- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2`
+- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3`
 - Dockerfile and build context: `codex-remote-devbox/Dockerfile` and `codex-remote-devbox/`
 - Base: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
 - Codex CLI: `@openai/codex@0.149.0`
@@ -53,12 +53,17 @@ The `codex-remote-devbox/` directory defines an SSH-accessible development envir
 - Required state mountpoints: `/home/codex` and `/workspaces`
 - Runtime access key: `/run/secrets/ssh-access/authorized_keys`
 - Runtime host key: `/run/secrets/ssh-host/ssh_host_ed25519_key`
+- Runtime Docker-host bundle: `/run/secrets/docker-host/`
 
 Both state paths must be explicit mountpoints; image-layer directories or a mount on only a parent path do not satisfy the contract. After validating the fixed identity, mount types, runtime keys, and OpenSSH configuration, the root entrypoint bootstraps only the two mount roots to UID/GID `1000` and mode `0700`, then verifies that `codex` can create and remove a temporary probe. Bootstrap is nonrecursive: it never seeds, wipes, changes, or migrates existing descendants. A missing, non-directory, symlinked, non-mountpoint, read-only, or otherwise unusable state root fails closed before SSH starts.
 
-The authorized-keys file accepts one or more bare OpenSSH public-key lines; per-key options are intentionally not accepted. Runtime key sources are treated as read-only inputs, copied into root-owned runtime files, and never written into either state mount. The root process chain remains `tini -g` to the entrypoint to foreground OpenSSH; authenticated sessions enter as `codex`, and termination signals are forwarded through that chain for bounded shutdown. SSH is public-key-only and fails closed when either runtime key is missing or invalid. The image grants `codex` full passwordless sudo as an explicit single-user development convenience, but it does not require privileged mode, a Docker socket, or broad host-filesystem access beyond the documented key and state mounts.
+The authorized-keys file accepts one or more bare OpenSSH public-key lines; per-key options are intentionally not accepted. Runtime key sources are treated as read-only inputs, copied into runtime files, and never written into either state mount. The root process chain remains `tini -g` to the entrypoint to foreground OpenSSH; authenticated sessions enter as `codex`, and termination signals are forwarded through that chain for bounded shutdown. SSH is public-key-only and fails closed when either runtime SSH key or any Docker-host bundle input is missing or invalid. The image grants `codex` full passwordless sudo as an explicit single-user development convenience, but it does not require privileged mode, mount a local Docker socket, or expose a daemon listener.
 
-The image includes a lean Node, Python, Git, GitHub CLI, SSH, and build toolset. It deliberately excludes Docker, Kubernetes tools, infrastructure CLIs, `nvm`, and `pyenv`. No Codex, GitHub, API, SSH, or user credentials are included in the image. Authenticate after connecting with `codex login --device-auth` and `gh auth login --git-protocol https`; persist both required state mountpoints across replacement when their contents must survive.
+Revision `r3` adds only Docker client packaging and remote-host wiring; Codex remains `0.149.0`, and every `r2` state, SSH-server, `tini`, signal, and no-init-container guarantee remains in force. The image installs only Docker's official pinned `docker-ce-cli` (`5:29.7.2-1~debian.12~bookworm`), `docker-buildx-plugin` (`0.36.1-1~debian.12~bookworm`), and `docker-compose-plugin` (`5.5.0-1~debian.12~bookworm`). It does not install Docker Engine, `dockerd`, `containerd`, DinD, Podman, or nerdctl.
+
+The required read-only Docker-host bundle contains `docker_host`, `ssh_alias`, `ssh_host`, `ssh_port`, `ssh_user`, `ssh_client_ed25519_private_key`, `ssh_client_ed25519_fingerprint`, `ssh_host_ed25519_fingerprint`, and `ssh_known_hosts`. The alias and host-key alias are fixed to `docker-host`; `HostName` remains the separately configured MagicDNS host. Startup validates the Ed25519 client key and the single alias-keyed pinned host entry without contacting the Mac, copies only the private key and known-hosts file into `/run`, creates a fail-closed system SSH client stanza, and injects only `DOCKER_HOST` into every SSH session through the runtime sshd configuration. It never writes the shared Docker SSH material under `/home/codex`, never sets `DOCKER_CONTEXT`, and does not make Mac or Docker Desktop reachability a readiness condition.
+
+The image also includes a lean Node, Python, Git, GitHub CLI, SSH, and build toolset. It deliberately excludes Kubernetes tools, infrastructure CLIs, `nvm`, and `pyenv`. No Codex, GitHub, API, SSH, or user credentials are included in the image. Authenticate after connecting with `codex login --device-auth` and `gh auth login --git-protocol https`; persist both required state mountpoints across replacement when their contents must survive. Docker commands use the remote Mac engine over pinned SSH. Build contexts are transferred by the client, but bind-mount source paths are resolved on the Mac daemon, not beneath the devbox's `/workspaces`.
 
 Codex Desktop starts its app server through the SSH connection, so the image does not start or expose an app-server listener. See the official [remote connections](https://learn.chatgpt.com/docs/remote-connections) and [authentication](https://learn.chatgpt.com/docs/auth) documentation.
 
