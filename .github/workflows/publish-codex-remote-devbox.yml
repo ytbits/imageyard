@@ -20,10 +20,14 @@ concurrency:
 
 env:
   IMAGE_NAME: codex-remote-devbox
-  IMAGE_TAG: codex-0.149.0-r2
+  IMAGE_TAG: codex-0.149.0-r3
   CODEX_VERSION: 0.149.0
   BASE_IMAGE_NAME: docker.io/library/node:24.19.0-bookworm-slim
   BASE_IMAGE_DIGEST: sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+  DOCKER_CLI_PACKAGE_VERSION: 5:29.7.2-1~debian.12~bookworm
+  DOCKER_BUILDX_PACKAGE_VERSION: 0.36.1-1~debian.12~bookworm
+  DOCKER_COMPOSE_PACKAGE_VERSION: 5.5.0-1~debian.12~bookworm
+  DOCKER_APT_GPG_SHA256: 1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
 
 jobs:
   guard:
@@ -164,27 +168,62 @@ jobs:
             org.opencontainers.image.base.name=${{ env.BASE_IMAGE_NAME }}
             org.opencontainers.image.base.digest=${{ env.BASE_IMAGE_DIGEST }}
             io.imageyard.codex.version=${{ env.CODEX_VERSION }}
+            io.imageyard.docker-ce-cli.package-version=${{ env.DOCKER_CLI_PACKAGE_VERSION }}
+            io.imageyard.docker-buildx-plugin.package-version=${{ env.DOCKER_BUILDX_PACKAGE_VERSION }}
+            io.imageyard.docker-compose-plugin.package-version=${{ env.DOCKER_COMPOSE_PACKAGE_VERSION }}
+            io.imageyard.docker.apt-gpg-sha256=${{ env.DOCKER_APT_GPG_SHA256 }}
 
       - name: Verify published index and record digests
         shell: bash
         env:
+          IMAGE: ${{ steps.image.outputs.image }}
           IMAGE_REF: ${{ steps.image.outputs.ref }}
           INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
           set -euo pipefail
 
           inspect_log="$(mktemp)"
-          trap 'rm -f "$inspect_log"' EXIT
-          docker buildx imagetools inspect "$IMAGE_REF" | tee "$inspect_log"
+          index_raw="$(mktemp)"
+          trap 'rm -f "$inspect_log" "$index_raw"' EXIT
+          [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          tag_digest="$(
+            docker buildx imagetools inspect "$IMAGE_REF" \
+              | awk '$1 == "Digest:" { print $2; exit }'
+          )"
+          [[ "$tag_digest" == "$INDEX_DIGEST" ]]
+
+          immutable_ref="${IMAGE}@${INDEX_DIGEST}"
+          docker buildx imagetools inspect "$immutable_ref" | tee "$inspect_log"
+          docker buildx imagetools inspect --raw "$immutable_ref" > "$index_raw"
 
           grep -Fq "Platform:    linux/amd64" "$inspect_log"
           grep -Fq "Platform:    linux/arm64" "$inspect_log"
+
+          amd64_digest="$(
+            jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | if length == 1 then .[0].digest else error("expected exactly one linux/amd64 manifest") end' \
+              "$index_raw"
+          )"
+          arm64_digest="$(
+            jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | if length == 1 then .[0].digest else error("expected exactly one linux/arm64 manifest") end' \
+              "$index_raw"
+          )"
+          amd64_config_digest="$(
+            docker buildx imagetools inspect --raw "${IMAGE}@${amd64_digest}" | jq -er '.config.digest'
+          )"
+          arm64_config_digest="$(
+            docker buildx imagetools inspect --raw "${IMAGE}@${arm64_digest}" | jq -er '.config.digest'
+          )"
 
           {
             echo "### Codex Remote Devbox published"
             echo
             echo "- Image: \`${IMAGE_REF}\`"
             echo "- OCI index digest: \`${INDEX_DIGEST}\`"
+            echo "- AMD64 manifest digest: \`${amd64_digest}\`"
+            echo "- AMD64 config digest: \`${amd64_config_digest}\`"
+            echo "- ARM64 manifest digest: \`${arm64_digest}\`"
+            echo "- ARM64 config digest: \`${arm64_config_digest}\`"
             echo "- Source revision: \`${GITHUB_SHA}\`"
             echo
             echo '```text'

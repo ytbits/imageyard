@@ -21,8 +21,12 @@ permissions:
 
 env:
   EXPECTED_CODEX_VERSION: 0.149.0
-  EXPECTED_IMAGE_TAG: codex-0.149.0-r2
+  EXPECTED_IMAGE_TAG: codex-0.149.0-r3
   EXPECTED_NODE_VERSION: 24.19.0
+  EXPECTED_DOCKER_CLI_PACKAGE_VERSION: 5:29.7.2-1~debian.12~bookworm
+  EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION: 0.36.1-1~debian.12~bookworm
+  EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION: 5.5.0-1~debian.12~bookworm
+  EXPECTED_DOCKER_APT_GPG_SHA256: 1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
   EXPECTED_BASE_IMAGE: node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
   EXPECTED_BASE_IMAGE_NAME: docker.io/library/node:24.19.0-bookworm-slim
   EXPECTED_BASE_IMAGE_DIGEST: sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
@@ -54,7 +58,7 @@ jobs:
             .github/workflows/validate-codex-remote-devbox.yml \
             .github/workflows/publish-codex-remote-devbox.yml
 
-      - name: Check Codex version and release tag consistency
+      - name: Check release and package pin consistency
         shell: bash
         run: |
           set -euo pipefail
@@ -105,6 +109,38 @@ jobs:
             sed -nE 's/^[[:space:]]+BASE_IMAGE_DIGEST:[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' \
               .github/workflows/publish-codex-remote-devbox.yml
           )"
+          docker_cli_package_version="$(
+            sed -nE 's/^ARG[[:space:]]+DOCKER_CLI_PACKAGE_VERSION="([^"]+)"[[:space:]]*$/\1/p' \
+              codex-remote-devbox/Dockerfile
+          )"
+          docker_buildx_package_version="$(
+            sed -nE 's/^ARG[[:space:]]+DOCKER_BUILDX_PACKAGE_VERSION="([^"]+)"[[:space:]]*$/\1/p' \
+              codex-remote-devbox/Dockerfile
+          )"
+          docker_compose_package_version="$(
+            sed -nE 's/^ARG[[:space:]]+DOCKER_COMPOSE_PACKAGE_VERSION="([^"]+)"[[:space:]]*$/\1/p' \
+              codex-remote-devbox/Dockerfile
+          )"
+          docker_apt_gpg_sha256="$(
+            sed -nE 's/^ARG[[:space:]]+DOCKER_APT_GPG_SHA256="([0-9a-f]{64})"[[:space:]]*$/\1/p' \
+              codex-remote-devbox/Dockerfile
+          )"
+          publish_docker_cli_package_version="$(
+            sed -nE 's/^[[:space:]]+DOCKER_CLI_PACKAGE_VERSION:[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' \
+              .github/workflows/publish-codex-remote-devbox.yml
+          )"
+          publish_docker_buildx_package_version="$(
+            sed -nE 's/^[[:space:]]+DOCKER_BUILDX_PACKAGE_VERSION:[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' \
+              .github/workflows/publish-codex-remote-devbox.yml
+          )"
+          publish_docker_compose_package_version="$(
+            sed -nE 's/^[[:space:]]+DOCKER_COMPOSE_PACKAGE_VERSION:[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' \
+              .github/workflows/publish-codex-remote-devbox.yml
+          )"
+          publish_docker_apt_gpg_sha256="$(
+            sed -nE 's/^[[:space:]]+DOCKER_APT_GPG_SHA256:[[:space:]]+([0-9a-f]{64})[[:space:]]*$/\1/p' \
+              .github/workflows/publish-codex-remote-devbox.yml
+          )"
 
           if [[ "$dockerfile_version" != "$EXPECTED_CODEX_VERSION" ]]; then
             echo "::error title=Codex version mismatch::Dockerfile pin '${dockerfile_version}' does not match ${EXPECTED_CODEX_VERSION}"
@@ -140,6 +176,22 @@ jobs:
           fi
           if [[ "$dockerfile_node_version" != "$EXPECTED_NODE_VERSION" ]]; then
             echo "::error title=Node version metadata mismatch::Dockerfile Node metadata '${dockerfile_node_version}' does not match ${EXPECTED_NODE_VERSION}"
+            exit 1
+          fi
+          if [[ "$docker_cli_package_version" != "$EXPECTED_DOCKER_CLI_PACKAGE_VERSION" || "$publish_docker_cli_package_version" != "$EXPECTED_DOCKER_CLI_PACKAGE_VERSION" ]]; then
+            echo "::error title=Docker CLI pin mismatch::Dockerfile and publish metadata must match ${EXPECTED_DOCKER_CLI_PACKAGE_VERSION}"
+            exit 1
+          fi
+          if [[ "$docker_buildx_package_version" != "$EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION" || "$publish_docker_buildx_package_version" != "$EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION" ]]; then
+            echo "::error title=Buildx pin mismatch::Dockerfile and publish metadata must match ${EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION}"
+            exit 1
+          fi
+          if [[ "$docker_compose_package_version" != "$EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION" || "$publish_docker_compose_package_version" != "$EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION" ]]; then
+            echo "::error title=Compose pin mismatch::Dockerfile and publish metadata must match ${EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION}"
+            exit 1
+          fi
+          if [[ "$docker_apt_gpg_sha256" != "$EXPECTED_DOCKER_APT_GPG_SHA256" || "$publish_docker_apt_gpg_sha256" != "$EXPECTED_DOCKER_APT_GPG_SHA256" ]]; then
+            echo "::error title=Docker apt key mismatch::Dockerfile and publish metadata must match the expected Docker apt GPG checksum"
             exit 1
           fi
 

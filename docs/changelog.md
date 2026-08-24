@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-24 - Add Pinned Remote Docker Client Layer
+
+- Bumped the Codex remote devbox packaging revision to immutable `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3` while preserving Codex CLI `0.149.0` and all `r2` state, SSH-server, `tini`, signal, and no-init-container behavior.
+- Added only Docker's official pinned Bookworm CLI, Buildx, and Compose packages for both `linux/amd64` and `linux/arm64`; Docker Engine, `dockerd`, `containerd`, DinD, Podman, nerdctl, local sockets, and daemon listeners remain excluded.
+- Added a fail-closed read-only Docker-host Secret contract with Ed25519 client-key and alias-keyed known-host fingerprint verification, runtime-only key copies, a strict system `docker-host`/`HostKeyAlias docker-host` SSH stanza, and runtime sshd `DOCKER_HOST` injection without `DOCKER_CONTEXT`.
+- Kept remote-host reachability out of startup readiness so a valid offline Mac can recover without a Pod restart, and documented that remote bind mounts resolve on the Mac daemon rather than under `/workspaces`.
+- Expanded two-architecture validation and publication evidence for exact Docker package versions, malformed and mismatched Secret bundles, source/runtime immutability, interactive and command SSH environments, daemon exclusions, config digests, and post-publication smoke.
+
 ## 2026-08-22 - Bootstrap Codex Remote Devbox State Mounts
 
 - Bumped the Codex remote devbox packaging revision to `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r2` without changing Codex CLI `0.149.0`.
