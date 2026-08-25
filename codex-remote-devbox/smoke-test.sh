@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4}"
 expected_codex_version="${EXPECTED_CODEX_VERSION:-0.149.0}"
 expected_docker_ce_cli_version="${EXPECTED_DOCKER_CLI_PACKAGE_VERSION:-5:29.7.2-1~debian.12~bookworm}"
 expected_docker_buildx_version="${EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION:-0.36.1-1~debian.12~bookworm}"
@@ -13,16 +14,29 @@ secret_marker="IMAGEYARD_SMOKE_SECRET_DO_NOT_BAKE_7e4fdd65"
 docker_secret_marker="IMAGEYARD_DOCKER_HOST_SECRET_DO_NOT_PERSIST_903ea3d1"
 state_marker="IMAGEYARD_SMOKE_STATE_PERSISTS_b91c6c82"
 docker_host_alias="docker-host"
-docker_host_hostname="192.0.2.1"
+docker_host_hostname="imageyard-fake-docker-host"
 docker_host_port="2222"
-docker_host_user="imageyard"
+docker_host_user="codex"
 docker_host_uri="ssh://docker-host/Users/imageyard/.docker/run/docker.sock"
+docker_remote_socket_path="/Users/imageyard/.docker/run/docker.sock"
+docker_bridge_runtime_dir="/run/codex-remote-devbox/docker-bridge"
+docker_bridge_socket="$docker_bridge_runtime_dir/docker.sock"
+docker_bridge_uri="unix://$docker_bridge_socket"
+testcontainers_docker_socket_override="/var/run/docker.sock"
+fake_docker_daemon_id="IMAGEYARD-R4-FAKE-DAEMON-ID"
+offline_docker_host_hostname="127.0.0.1"
+offline_docker_host_port="1"
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-remote-devbox-smoke.XXXXXX")"
 fixture_token="${fixture_dir##*.}"
 name_prefix="codex-remote-devbox-smoke-$$-${fixture_token}"
 
 primary_container="${name_prefix}-primary"
 restart_container="${name_prefix}-restart"
+offline_container="${name_prefix}-offline"
+bridge_failure_container="${name_prefix}-bridge-failure"
+sshd_failure_container="${name_prefix}-sshd-failure"
+docker_backend_container="${name_prefix}-docker-backend"
+docker_backend_network="${name_prefix}-backend-network"
 audit_container="${name_prefix}-audit"
 filesystem_audit_container="${name_prefix}-filesystem-audit"
 volume_helper_container="${name_prefix}-volume-helper"
@@ -47,6 +61,10 @@ readonly_workspace_container="${name_prefix}-readonly-workspace"
 
 home_volume="${name_prefix}-home"
 workspace_volume="${name_prefix}-workspaces"
+offline_home_volume="${name_prefix}-offline-home"
+offline_workspace_volume="${name_prefix}-offline-workspaces"
+supervision_home_volume="${name_prefix}-supervision-home"
+supervision_workspace_volume="${name_prefix}-supervision-workspaces"
 support_home_volume="${name_prefix}-support-home"
 support_workspace_volume="${name_prefix}-support-workspaces"
 readonly_home_volume="${name_prefix}-readonly-home"
@@ -58,6 +76,10 @@ parent_home_volume="${name_prefix}-parent-home"
 declare -a cleanup_containers=(
   "$primary_container"
   "$restart_container"
+  "$offline_container"
+  "$bridge_failure_container"
+  "$sshd_failure_container"
+  "$docker_backend_container"
   "$audit_container"
   "$filesystem_audit_container"
   "$volume_helper_container"
@@ -86,6 +108,8 @@ declare -a docker_host_source_files=()
 declare -a sensitive_docker_host_files=()
 forward_pid=""
 signal_session_pid=""
+bridge_hold_pid=""
+signal_bridge_pid=""
 
 fail() {
   printf 'smoke-test: %s\n' "$*" >&2
@@ -106,8 +130,17 @@ cleanup() {
     kill "$signal_session_pid" >/dev/null 2>&1 || true
     wait "$signal_session_pid" >/dev/null 2>&1 || true
   fi
+  if [ -n "$bridge_hold_pid" ]; then
+    kill "$bridge_hold_pid" >/dev/null 2>&1 || true
+    wait "$bridge_hold_pid" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$signal_bridge_pid" ]; then
+    kill "$signal_bridge_pid" >/dev/null 2>&1 || true
+    wait "$signal_bridge_pid" >/dev/null 2>&1 || true
+  fi
 
   docker rm -f "${cleanup_containers[@]}" >/dev/null 2>&1 || true
+  docker network rm "$docker_backend_network" >/dev/null 2>&1 || true
   if [ "${#cleanup_volumes[@]}" -gt 0 ]; then
     docker volume rm -f "${cleanup_volumes[@]}" >/dev/null 2>&1 || true
   fi
@@ -153,8 +186,18 @@ done
 
 docker image inspect "$image" >/dev/null 2>&1 \
   || fail "image is not available locally: $image"
+for fixture_file in \
+  "$script_dir/docker-bridge-client-smoke.js" \
+  "$script_dir/fake-docker-backend.py" \
+  "$script_dir/fake-docker-sshd_config"; do
+  [ -f "$fixture_file" ] || fail "required smoke fixture is unavailable: $fixture_file"
+done
 
-mkdir -p "$fixture_dir/access" "$fixture_dir/host" "$fixture_dir/docker-host"
+mkdir -p \
+  "$fixture_dir/access" \
+  "$fixture_dir/host" \
+  "$fixture_dir/docker-host" \
+  "$fixture_dir/docker-backend"
 
 ssh-keygen -q -t ed25519 -N '' -C "$secret_marker" -f "$fixture_dir/client_key"
 ssh-keygen -q -t ed25519 -N '' -C unknown-smoke-client -f "$fixture_dir/unknown_key"
@@ -251,6 +294,17 @@ chmod 0444 \
   "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint" \
   "$fixture_dir/docker-host/ssh_known_hosts"
 
+cp "$fixture_dir/docker_remote_host_key" \
+  "$fixture_dir/docker-backend/ssh_host_ed25519_key"
+cp "$fixture_dir/docker_client_key.pub" \
+  "$fixture_dir/docker-backend/authorized_keys"
+cp "$script_dir/fake-docker-sshd_config" \
+  "$fixture_dir/docker-backend/sshd_config"
+chmod 0400 "$fixture_dir/docker-backend/ssh_host_ed25519_key"
+chmod 0444 \
+  "$fixture_dir/docker-backend/authorized_keys" \
+  "$fixture_dir/docker-backend/sshd_config"
+
 secret_source_files=(
   "$fixture_dir/access/authorized_keys"
   "$fixture_dir/host/ssh_host_ed25519_key"
@@ -259,6 +313,8 @@ secret_source_files=(
   "$fixture_dir/mixed_invalid_authorized_keys"
   "$fixture_dir/client_key"
   "$fixture_dir/invalid_host_key"
+  "$fixture_dir/docker-backend/authorized_keys"
+  "$fixture_dir/docker-backend/ssh_host_ed25519_key"
 )
 docker_host_source_files=(
   "$fixture_dir/docker-host/docker_host"
@@ -395,6 +451,12 @@ seed_legacy_home_ssh_config() {
       "  HostName legacy-home.invalid" \
       "  User legacy-user" \
       "  IdentityFile ~/.ssh/legacy-docker-mac" \
+      "" \
+      "Host docker-host" \
+      "  HostName adversarial-home.invalid" \
+      "  User adversarial-user" \
+      "  Port 1" \
+      "  ProxyCommand false" \
       > /state/.ssh/config
     chown 1000:1000 /state/.ssh/config
     chmod 0600 /state/.ssh/config
@@ -415,7 +477,13 @@ assert_legacy_home_ssh_config_preserved() {
       "Host docker-mac" \
       "  HostName legacy-home.invalid" \
       "  User legacy-user" \
-      "  IdentityFile ~/.ssh/legacy-docker-mac")"
+      "  IdentityFile ~/.ssh/legacy-docker-mac" \
+      "" \
+      "Host docker-host" \
+      "  HostName adversarial-home.invalid" \
+      "  User adversarial-user" \
+      "  Port 1" \
+      "  ProxyCommand false")"
     test "$(cat /state/.ssh/config)" = "$expected"
     test ! -e /state/.ssh/ssh_client_ed25519_private_key
     test ! -e /state/.ssh/ssh_known_hosts
@@ -538,6 +606,10 @@ assert_state_excludes_secret_marker() {
 for volume_name in \
   "$home_volume" \
   "$workspace_volume" \
+  "$offline_home_volume" \
+  "$offline_workspace_volume" \
+  "$supervision_home_volume" \
+  "$supervision_workspace_volume" \
   "$support_home_volume" \
   "$support_workspace_volume" \
   "$readonly_home_volume" \
@@ -568,15 +640,22 @@ start_container() {
   local container_name="$1"
   local container_home_volume="$2"
   local container_workspace_volume="$3"
+  local docker_host_bundle="${4:-$fixture_dir/docker-host}"
+  local container_network="${5:-bridge}"
 
   docker run --detach \
     --name "$container_name" \
+    --network "$container_network" \
     --publish 127.0.0.1::2222 \
     --env DOCKER_HOST=ssh://wrong-parent-environment/should-not-reach-ssh-sessions.sock \
     --env DOCKER_CONTEXT=wrong-parent-context \
+    --env DOCKER_TLS_VERIFY=1 \
+    --env DOCKER_CERT_PATH=/wrong-parent-docker-certs \
+    --env TESTCONTAINERS_HOST_OVERRIDE=wrong-parent-testcontainers-host \
+    --env TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/wrong-parent-docker.sock \
     --mount "type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
     --mount "type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
-    --mount "type=bind,src=$fixture_dir/docker-host,dst=/run/secrets/docker-host,readonly" \
+    --mount "type=bind,src=$docker_host_bundle,dst=/run/secrets/docker-host,readonly" \
     --mount "type=volume,src=$container_home_volume,dst=/home/codex,volume-nocopy" \
     --mount "type=volume,src=$container_workspace_volume,dst=/workspaces,volume-nocopy" \
     "$image" >/dev/null
@@ -626,6 +705,281 @@ ssh_command() {
     -o "UserKnownHostsFile=$known_hosts_file" \
     "${user}@127.0.0.1" \
     "$@"
+}
+
+expected_ssh_docker_environment() {
+  local expected_host="$1"
+
+  printf '%s\n' \
+    "DOCKER_HOST=$docker_bridge_uri" \
+    "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=$testcontainers_docker_socket_override" \
+    "TESTCONTAINERS_HOST_OVERRIDE=$expected_host" \
+    | LC_ALL=C sort
+}
+
+assert_ssh_docker_environment() {
+  local known_hosts_file="$1"
+  local port="$2"
+  local expected_host="$3"
+  local context="$4"
+  local expected_environment
+  local actual_environment
+
+  expected_environment="$(expected_ssh_docker_environment "$expected_host")"
+  actual_environment="$(
+    ssh_command "$known_hosts_file" "$port" "$fixture_dir/client_key" codex \
+      'env | LC_ALL=C awk -F= '\''$1 ~ /^(DOCKER_|TESTCONTAINERS_)/ { print }'\'' | LC_ALL=C sort'
+  )" || fail "$context could not inspect the SSH Docker environment"
+  if [ "$actual_environment" != "$expected_environment" ]; then
+    printf 'smoke-test: expected SSH Docker environment:\n%s\n' \
+      "$expected_environment" >&2
+    printf 'smoke-test: actual SSH Docker environment:\n%s\n' \
+      "$actual_environment" >&2
+    fail "$context received an unexpected SSH Docker environment"
+  fi
+}
+
+container_exact_process_pid() {
+  local container_name="$1"
+  local expected_cmdline="$2"
+
+  docker exec "$container_name" /bin/sh -c '
+    set -eu
+    expected=$1
+    count=0
+    found=
+    for process_dir in /proc/[0-9]*; do
+      test -r "$process_dir/cmdline" || continue
+      cmdline="$(tr "\000" " " < "$process_dir/cmdline" 2>/dev/null || true)"
+      if test "$cmdline" = "$expected "; then
+        count=$((count + 1))
+        found=${process_dir##*/}
+      fi
+    done
+    test "$count" -eq 1
+    printf "%s\n" "$found"
+  ' smoke-process "$expected_cmdline"
+}
+
+container_supervised_sshd_pid() {
+  local container_name="$1"
+  local supervisor_pid="$2"
+
+  docker exec "$container_name" /bin/sh -c '
+    set -eu
+    supervisor_pid=$1
+    count=0
+    found=
+    for process_dir in /proc/[0-9]*; do
+      test -r "$process_dir/status" || continue
+      test -e "$process_dir/exe" || continue
+      test "$(readlink -f "$process_dir/exe" 2>/dev/null || true)" = /usr/sbin/sshd || continue
+      parent="$(awk "\$1 == \"PPid:\" { print \$2 }" "$process_dir/status")"
+      if test "$parent" = "$supervisor_pid"; then
+        count=$((count + 1))
+        found=${process_dir##*/}
+      fi
+    done
+    test "$count" -eq 1
+    printf "%s\n" "$found"
+  ' smoke-supervised-sshd "$supervisor_pid"
+}
+
+bridge_ssh_child_count() {
+  local container_name="$1"
+  local remote_socket_path="$2"
+  local bridge_pid
+
+  bridge_pid="$(container_exact_process_pid \
+    "$container_name" \
+    "/usr/local/bin/node /usr/local/libexec/docker-bridge.js $remote_socket_path")" \
+    || fail "could not identify the Docker bridge in $container_name"
+  docker exec "$container_name" /bin/sh -c '
+    set -eu
+    bridge_pid=$1
+    count=0
+    for process_dir in /proc/[0-9]*; do
+      test -r "$process_dir/status" || continue
+      parent="$(awk "\$1 == \"PPid:\" { print \$2 }" "$process_dir/status")"
+      if test "$parent" = "$bridge_pid"; then
+        first_argument="$(tr "\000" "\n" < "$process_dir/cmdline" 2>/dev/null | sed -n "1p" || true)"
+        test "$first_argument" = /usr/bin/ssh || exit 1
+        count=$((count + 1))
+      fi
+    done
+    printf "%s\n" "$count"
+  ' smoke-bridge-children "$bridge_pid"
+}
+
+assert_bridge_runtime_contract() {
+  local container_name="$1"
+  local remote_socket_path="$2"
+  local supervisor_pid
+  local bridge_pid
+  local sshd_pid
+
+  supervisor_pid="$(container_exact_process_pid \
+    "$container_name" \
+    "/usr/local/bin/node /usr/local/libexec/supervisor.js $remote_socket_path")" \
+    || fail "could not identify the service supervisor in $container_name"
+  bridge_pid="$(container_exact_process_pid \
+    "$container_name" \
+    "/usr/local/bin/node /usr/local/libexec/docker-bridge.js $remote_socket_path")" \
+    || fail "could not identify the Docker bridge in $container_name"
+  sshd_pid="$(container_supervised_sshd_pid \
+    "$container_name" \
+    "$supervisor_pid")" \
+    || fail "could not identify foreground OpenSSH in $container_name"
+
+  docker exec "$container_name" /bin/sh -c '
+    set -eu
+    supervisor_pid=$1
+    bridge_pid=$2
+    sshd_pid=$3
+    runtime_dir=$4
+    socket_path=$5
+
+    test "$(ps -o ppid= -p "$supervisor_pid" | tr -d " ")" = 1
+    test "$(ps -o user= -p "$supervisor_pid" | tr -d " ")" = root
+    test "$(ps -o ppid= -p "$bridge_pid" | tr -d " ")" = "$supervisor_pid"
+    test "$(ps -o user= -p "$bridge_pid" | tr -d " ")" = codex
+    test "$(ps -o ppid= -p "$sshd_pid" | tr -d " ")" = "$supervisor_pid"
+    test "$(ps -o user= -p "$sshd_pid" | tr -d " ")" = root
+    test "$(readlink -f "/proc/$supervisor_pid/exe")" = /usr/local/bin/node
+    test "$(readlink -f "/proc/$sshd_pid/exe")" = /usr/sbin/sshd
+    awk '\''
+      $1 == "Groups:" { if (NF != 1) exit 1; groups = 1 }
+      $1 == "CapEff:" { if ($2 !~ /^0+$/) exit 1; capabilities = 1 }
+      $1 == "NoNewPrivs:" { if ($2 != 1) exit 1; no_new_privs = 1 }
+      END { exit groups && capabilities && no_new_privs ? 0 : 1 }
+    '\'' "/proc/$bridge_pid/status"
+    sshd_cmdline="$(tr "\000" " " < "/proc/$sshd_pid/cmdline")"
+    case "$sshd_cmdline" in
+      *"-D -e -f /run/codex-remote-devbox/sshd_config"*) ;;
+      *) exit 1 ;;
+    esac
+
+    test -d "$runtime_dir"
+    test ! -L "$runtime_dir"
+    test "$(stat -c "%u:%g:%a" -- "$runtime_dir")" = 1000:1000:700
+    test -S "$socket_path"
+    test ! -L "$socket_path"
+    test "$(stat -c "%u:%g:%a" -- "$socket_path")" = 1000:1000:600
+    awk -v expected="$socket_path" '\''
+      $8 == expected { listeners++ }
+      END { exit listeners == 1 ? 0 : 1 }
+    '\'' /proc/net/unix
+  ' smoke-bridge-runtime \
+    "$supervisor_pid" \
+    "$bridge_pid" \
+    "$sshd_pid" \
+    "$docker_bridge_runtime_dir" \
+    "$docker_bridge_socket" \
+    || {
+      docker exec "$container_name" /bin/sh -c '
+        supervisor_pid=$1
+        bridge_pid=$2
+        sshd_pid=$3
+        runtime_dir=$4
+        socket_path=$5
+        ps -o pid=,ppid=,user=,comm= -p "$supervisor_pid,$bridge_pid,$sshd_pid" || true
+        for process_pid in "$supervisor_pid" "$bridge_pid" "$sshd_pid"; do
+          printf "pid=%s exe=%s cmdline=%s\n" \
+            "$process_pid" \
+            "$(readlink -f "/proc/$process_pid/exe" 2>/dev/null || true)" \
+            "$(tr "\000" " " < "/proc/$process_pid/cmdline" 2>/dev/null || true)"
+        done
+        stat -c "runtime=%u:%g:%a:%F" -- "$runtime_dir" || true
+        stat -c "socket=%u:%g:%a:%F" -- "$socket_path" || true
+        awk -v expected="$socket_path" '\''$8 == expected { print "unix=" $0 }'\'' /proc/net/unix
+      ' smoke-bridge-diagnostic \
+        "$supervisor_pid" \
+        "$bridge_pid" \
+        "$sshd_pid" \
+        "$docker_bridge_runtime_dir" \
+        "$docker_bridge_socket" >&2 || true
+      fail "$container_name violates the supervised Docker bridge runtime contract"
+    }
+}
+
+wait_for_runtime_failure() {
+  local container_name="$1"
+  local log_file="$2"
+  local expected_log="$3"
+  local attempt
+  local exit_code
+
+  for attempt in $(seq 1 80); do
+    if [ "$(docker inspect --format '{{.State.Running}}' "$container_name")" != true ]; then
+      exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$container_name")"
+      docker logs "$container_name" >"$log_file" 2>&1 || true
+      [ "$exit_code" -ne 0 ] \
+        || fail "$container_name exited successfully after a supervised child failure"
+      [ "$exit_code" -ne 137 ] \
+        || fail "$container_name required SIGKILL after a supervised child failure"
+      [ "$(docker inspect --format '{{.State.OOMKilled}}' "$container_name")" = false ] \
+        || fail "$container_name was OOM-killed after a supervised child failure"
+      grep -Fq "$expected_log" "$log_file" \
+        || fail "$container_name did not report the supervised child failure"
+      assert_log_excludes_key_material "$log_file"
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  docker logs "$container_name" >&2 || true
+  fail "$container_name remained running after a supervised child failure"
+}
+
+start_fake_docker_backend() {
+  if docker network inspect "$docker_backend_network" >/dev/null 2>&1; then
+    fail "refusing to reuse a pre-existing smoke-test network: $docker_backend_network"
+  fi
+  docker network create "$docker_backend_network" >/dev/null
+
+  docker run --detach \
+    --name "$docker_backend_container" \
+    --network "$docker_backend_network" \
+    --network-alias "$docker_host_hostname" \
+    --entrypoint /usr/sbin/sshd \
+    --mount "type=bind,src=$fixture_dir/docker-backend,dst=/run/imageyard-backend,readonly" \
+    --mount "type=bind,src=$script_dir/fake-docker-backend.py,dst=/usr/local/bin/docker,readonly" \
+    "$image" \
+    -D -e -f /run/imageyard-backend/sshd_config \
+    >/dev/null
+
+  for attempt in $(seq 1 40); do
+    if [ "$(docker inspect --format '{{.State.Running}}' "$docker_backend_container")" != true ]; then
+      docker logs "$docker_backend_container" >&2 || true
+      fail "the deterministic fake Docker SSH backend exited before readiness"
+    fi
+    if docker exec "$docker_backend_container" /bin/sh -c \
+      'test "$(ss -H -lnt "sport = :2222" | wc -l)" -gt 0'; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  docker logs "$docker_backend_container" >&2 || true
+  fail "the deterministic fake Docker SSH backend did not become ready"
+}
+
+assert_fake_backend_argv() {
+  docker exec "$docker_backend_container" python3 -c '
+import pathlib
+import sys
+
+records = pathlib.Path("/tmp/imageyard-fake-docker-argv.log").read_bytes().splitlines()
+expected = [
+    b"/usr/local/bin/docker",
+    ("--host=unix://" + sys.argv[1]).encode("ascii"),
+    b"system",
+    b"dial-stdio",
+]
+if not records or any(record.split(b"\0") != expected for record in records):
+    raise SystemExit(1)
+' "$docker_remote_socket_path" \
+    || fail "the fake Docker backend received unexpected remote command arguments"
 }
 
 assert_log_excludes_key_material() {
@@ -868,8 +1222,8 @@ if grep -Fq "$secret_marker" "$fixture_dir/image-inspect.json" \
   fail "image metadata contains the smoke-test secret marker"
 fi
 if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
-  | grep -E '^DOCKER_(HOST|CONTEXT)=' >/dev/null; then
-  fail "image metadata sets DOCKER_HOST or DOCKER_CONTEXT"
+  | grep -E '^(DOCKER_|TESTCONTAINERS_)' >/dev/null; then
+  fail "image metadata sets Docker or Testcontainers runtime variables"
 fi
 docker history --no-trunc "$image" > "$fixture_dir/image-history.txt"
 if grep -Fq "$secret_marker" "$fixture_dir/image-history.txt" \
@@ -904,7 +1258,13 @@ if ! docker run --rm \
   fail "image filesystem contains credential material or the smoke-test marker"
 fi
 
-start_container "$primary_container" "$home_volume" "$workspace_volume"
+start_fake_docker_backend
+start_container \
+  "$primary_container" \
+  "$home_volume" \
+  "$workspace_volume" \
+  "$fixture_dir/docker-host" \
+  "$docker_backend_network"
 primary_known_hosts="$fixture_dir/known_hosts.primary"
 primary_port="$(wait_for_ssh "$primary_container" "$primary_known_hosts")"
 primary_fingerprint="$(ssh-keygen -E sha256 -lf "$primary_known_hosts" | awk 'NR == 1 { print $2 }')"
@@ -946,14 +1306,6 @@ docker exec "$primary_container" /bin/sh -c '
   set -eu
   test "$(ps -o comm= -p 1 | tr -d " ")" = tini
   test "$(tr "\000" " " < /proc/1/cmdline)" = "/usr/bin/tini -g -- /usr/local/bin/codex-remote-devbox-entrypoint "
-  sshd_pid="$(pgrep -o -x sshd)"
-  test -n "$sshd_pid"
-  test "$(ps -o user= -p "$sshd_pid" | tr -d " ")" = root
-  sshd_cmdline="$(tr "\000" " " < "/proc/$sshd_pid/cmdline")"
-  case "$sshd_cmdline" in
-    *"-f /run/codex-remote-devbox/sshd_config"*) ;;
-    *) exit 1 ;;
-  esac
   for forbidden_socket in \
     /run/docker.sock \
     /var/run/docker.sock \
@@ -967,6 +1319,17 @@ docker exec "$primary_container" /bin/sh -c '
     fi
   done
 '
+assert_bridge_runtime_contract "$primary_container" "$docker_remote_socket_path"
+
+docker exec "$primary_container" /bin/sh -c '
+  set -eu
+  test "$DOCKER_HOST" = ssh://wrong-parent-environment/should-not-reach-ssh-sessions.sock
+  test "$DOCKER_CONTEXT" = wrong-parent-context
+  test "$DOCKER_TLS_VERIFY" = 1
+  test "$DOCKER_CERT_PATH" = /wrong-parent-docker-certs
+  test "$TESTCONTAINERS_HOST_OVERRIDE" = wrong-parent-testcontainers-host
+  test "$TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE" = /wrong-parent-docker.sock
+' || fail "docker exec did not preserve the deliberately hostile container-spec environment"
 
 docker exec "$primary_container" /bin/sh -c '
   set -eu
@@ -1020,7 +1383,13 @@ docker exec "$primary_container" /bin/sh -c '
   test "$(grep -Ec "^Host[[:space:]]+docker-host$" "$client_config")" = 1
   test "$(grep -Ec "^Host[[:space:]]" "$client_config")" = 1
   grep -Fxq "  HostKeyAlias docker-host" "$client_config"
-  effective="$(sudo -n -u codex -- ssh -G docker-host 2>/dev/null)"
+  home_effective="$(sudo -n -H -u codex -- ssh -G docker-host 2>/dev/null)"
+  printf "%s\n" "$home_effective" | grep -Fxq "hostname adversarial-home.invalid"
+  printf "%s\n" "$home_effective" | grep -Fxq "user adversarial-user"
+  printf "%s\n" "$home_effective" | grep -Fxq "port 1"
+  printf "%s\n" "$home_effective" | grep -Fxq "proxycommand false"
+
+  effective="$(sudo -n -H -u codex -- ssh -G -F /etc/ssh/ssh_config docker-host 2>/dev/null)"
   has_setting() {
     printf "%s\n" "$effective" | grep -Fxq -- "$1"
   }
@@ -1031,6 +1400,7 @@ docker exec "$primary_container" /bin/sh -c '
   has_setting "identityfile $runtime_dir/$client_key"
   has_setting "identitiesonly yes"
   has_setting "batchmode yes"
+  has_setting "connecttimeout 10"
   has_setting "preferredauthentications publickey"
   has_setting "passwordauthentication no"
   has_setting "kbdinteractiveauthentication no"
@@ -1041,12 +1411,19 @@ docker exec "$primary_container" /bin/sh -c '
   has_setting "updatehostkeys false"
   has_setting "forwardagent no"
 
-  grep -Fxq "SetEnv DOCKER_HOST=$4" /run/codex-remote-devbox/sshd_config
+  test "$(grep -Ec "^SetEnv[[:space:]]" /run/codex-remote-devbox/sshd_config)" = 1
+  grep -Fxq "SetEnv DOCKER_HOST=$4 TESTCONTAINERS_HOST_OVERRIDE=$1 TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=$5" \
+    /run/codex-remote-devbox/sshd_config
+  if grep -Fq "$6" /run/codex-remote-devbox/sshd_config; then
+    exit 1
+  fi
   /usr/sbin/sshd -t -f /run/codex-remote-devbox/sshd_config
 ' sh \
   "$docker_host_hostname" \
   "$docker_host_user" \
   "$docker_host_port" \
+  "$docker_bridge_uri" \
+  "$testcontainers_docker_socket_override" \
   "$docker_host_uri"
 
 clean_stdout="$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
@@ -1064,9 +1441,11 @@ assert_log_excludes_key_material "$fixture_dir/ssh.stderr"
 [ "$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex 'sudo -n id -u')" = 0 ] \
   || fail "passwordless sudo is unavailable"
 
-ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
-  "set -eu; test \"\${DOCKER_HOST-}\" = '$docker_host_uri'; test -z \"\${DOCKER_CONTEXT+x}\"" \
-  || fail "command SSH session did not receive only the validated DOCKER_HOST"
+assert_ssh_docker_environment \
+  "$primary_known_hosts" \
+  "$primary_port" \
+  "$docker_host_hostname" \
+  "command SSH session"
 
 interactive_probe_output="$fixture_dir/interactive-docker-env.stdout"
 interactive_probe_error="$fixture_dir/interactive-docker-env.stderr"
@@ -1074,9 +1453,12 @@ if ! {
   printf '%s\n' \
     'export HISTFILE=/dev/null' \
     'set -eu' \
-    'test -n "${DOCKER_HOST-}"' \
-    'case "$DOCKER_HOST" in ssh://docker-host/*) ;; *) false ;; esac' \
+    "test \"\${DOCKER_HOST-}\" = '$docker_bridge_uri'" \
+    "test \"\${TESTCONTAINERS_HOST_OVERRIDE-}\" = '$docker_host_hostname'" \
+    "test \"\${TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE-}\" = '$testcontainers_docker_socket_override'" \
     'test -z "${DOCKER_CONTEXT+x}"' \
+    'test -z "${DOCKER_TLS_VERIFY+x}"' \
+    'test -z "${DOCKER_CERT_PATH+x}"' \
     'printf "%s\\n" docker-env-interactive-ok' \
     'exit'
 } | ssh \
@@ -1098,21 +1480,186 @@ grep -Fq docker-env-interactive-ok "$interactive_probe_output" \
   || fail "interactive SSH session did not receive DOCKER_HOST"
 assert_log_excludes_key_material "$interactive_probe_output"
 assert_log_excludes_key_material "$interactive_probe_error"
-if grep -Fq wrong-parent-context "$interactive_probe_output" \
-  || grep -Fq wrong-parent-context "$interactive_probe_error"; then
-  fail "interactive SSH session inherited DOCKER_CONTEXT"
-fi
+for hostile_value in \
+  wrong-parent-context \
+  wrong-parent-testcontainers-host \
+  wrong-parent-docker.sock \
+  wrong-parent-docker-certs; do
+  if grep -Fq "$hostile_value" "$interactive_probe_output" \
+    || grep -Fq "$hostile_value" "$interactive_probe_error"; then
+    fail "interactive SSH session inherited hostile container-spec environment"
+  fi
+done
 
-ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
+client_smoke_output="$(
+  ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+    'node -' < "$script_dir/docker-bridge-client-smoke.js"
+)" || fail "the deterministic Docker bridge client smoke failed"
+client_daemon_id="${client_smoke_output##* }"
+[ "$client_daemon_id" = "$fake_docker_daemon_id" ] \
+  || fail "the bridge client did not reach the expected fake Docker daemon"
+cli_daemon_id="$(
+  ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+    "docker info --format '{{.ID}}'"
+)" || fail "Docker CLI could not use the local Unix bridge"
+[ "$cli_daemon_id" = "$client_daemon_id" ] \
+  || fail "Docker CLI and the bridge client reached different daemon IDs"
+direct_ssh_daemon_id="$(
+  docker exec "$primary_container" /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root \
+    LANG=C.UTF-8 \
+    "DOCKER_HOST=$docker_host_uri" \
+    /bin/sh -c '
+    set -eu
+    test "$HOME" = /root
+    test "$DOCKER_HOST" = "$1"
+    test -z "${DOCKER_CONFIG+x}"
+    test -z "${DOCKER_CONTEXT+x}"
+    test -z "${DOCKER_TLS_VERIFY+x}"
+    test -z "${DOCKER_CERT_PATH+x}"
+    test -z "${TESTCONTAINERS_HOST_OVERRIDE+x}"
+    test -z "${TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE+x}"
+    test ! -e /root/.ssh/config
+    test -r /etc/ssh/ssh_config.d/20-codex-docker-host.conf
+    docker info --format "{{.ID}}"
+  ' direct-docker-ssh "$docker_host_uri"
+)" || fail "the validated path-bearing Docker SSH URI could not reach the fake daemon"
+[ "$direct_ssh_daemon_id" = "$client_daemon_id" ] \
+  || fail "the direct Docker SSH connhelper and local bridge reached different daemon IDs"
+assert_fake_backend_argv
+for attempt in $(seq 1 40); do
+  if [ "$(bridge_ssh_child_count "$primary_container" "$docker_remote_socket_path")" = 0 ]; then
+    break
+  fi
+  sleep 0.25
+done
+[ "$(bridge_ssh_child_count "$primary_container" "$docker_remote_socket_path")" = 0 ] \
+  || fail "bridge transports remained after deterministic client exercises"
+
+bridge_hold_output="$fixture_dir/bridge-hold.stdout"
+bridge_hold_error="$fixture_dir/bridge-hold.stderr"
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  'exec node -e '"'"'const net=require("node:net");const target=process.env.DOCKER_HOST;const socket=net.createConnection({path:target.slice("unix://".length),allowHalfOpen:true},()=>{socket.write(Buffer.from("POST /hijack HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n"));process.stdout.write("bridge-hold-ready:"+process.pid+"\n");});socket.on("data",()=>{});socket.on("error",()=>process.exit(1));setInterval(()=>{},1000);'"'"'' \
+  >"$bridge_hold_output" 2>"$bridge_hold_error" &
+bridge_hold_pid=$!
+bridge_hold_ready=false
+for attempt in $(seq 1 40); do
+  if ! kill -0 "$bridge_hold_pid" >/dev/null 2>&1; then
+    break
+  fi
+  if grep -Fq bridge-hold-ready "$bridge_hold_output" 2>/dev/null; then
+    bridge_hold_ready=true
+    break
+  fi
+  sleep 0.25
+done
+[ "$bridge_hold_ready" = true ] \
+  || fail "could not hold a Docker bridge connection for argv inspection"
+bridge_remote_hold_pid="$(sed -nE 's/^bridge-hold-ready:([0-9]+)$/\1/p' "$bridge_hold_output")"
+case "$bridge_remote_hold_pid" in
+  ''|*[!0-9]*) fail "could not identify the remote Docker bridge holder" ;;
+esac
+
+bridge_pid="$(container_exact_process_pid \
+  "$primary_container" \
+  "/usr/local/bin/node /usr/local/libexec/docker-bridge.js $docker_remote_socket_path")" \
+  || fail "could not identify the bridge for SSH argv inspection"
+docker exec "$primary_container" /bin/sh -c '
   set -eu
-  if timeout --signal=KILL 5 docker info >/dev/null 2>&1; then
+  bridge_pid=$1
+  remote_socket=$2
+  count=0
+  ssh_pid=
+  for process_dir in /proc/[0-9]*; do
+    test -r "$process_dir/status" || continue
+    parent="$(awk "\$1 == \"PPid:\" { print \$2 }" "$process_dir/status")"
+    if test "$parent" = "$bridge_pid"; then
+      first_argument="$(tr "\000" "\n" < "$process_dir/cmdline" 2>/dev/null | sed -n "1p" || true)"
+      test "$first_argument" = /usr/bin/ssh || exit 1
+      count=$((count + 1))
+      ssh_pid=${process_dir##*/}
+    fi
+  done
+  test "$count" -eq 1
+  test "$(ps -o user= -p "$ssh_pid" | tr -d " ")" = codex
+  actual="$(tr "\000" "\n" < "/proc/$ssh_pid/cmdline")"
+  expected="$(printf "%s\n" \
+    /usr/bin/ssh \
+    -F \
+    /etc/ssh/ssh_config \
+    -T \
+    -o \
+    ClearAllForwardings=yes \
+    -o \
+    ControlMaster=no \
+    -o \
+    ControlPath=none \
+    -- \
+    docker-host \
+    docker \
+    "--host=unix://$remote_socket" \
+    system \
+    dial-stdio)"
+  if test "$actual" != "$expected"; then
+    printf "expected argv:\n%s\nactual argv:\n%s\n" "$expected" "$actual" >&2
     exit 1
   fi
-  test -n "${DOCKER_HOST-}"
-  test -z "${DOCKER_CONTEXT+x}"
-' || fail "offline Docker host behavior violated the SSH session contract"
-[ "$(docker inspect --format '{{.State.Running}}' "$primary_container")" = true ] \
-  || fail "an unreachable Docker host stopped the devbox"
+' smoke-fixed-ssh-argv "$bridge_pid" "$docker_remote_socket_path" \
+  || fail "the bridge SSH child does not use the exact fixed argv"
+
+docker exec "$primary_container" kill -TERM "$bridge_remote_hold_pid" >/dev/null \
+  || fail "could not terminate the remote Docker bridge holder"
+wait "$bridge_hold_pid" >/dev/null 2>&1 || true
+bridge_hold_pid=""
+assert_log_excludes_key_material "$bridge_hold_output"
+assert_log_excludes_key_material "$bridge_hold_error"
+for attempt in $(seq 1 40); do
+  if [ "$(bridge_ssh_child_count "$primary_container" "$docker_remote_socket_path")" = 0 ]; then
+    break
+  fi
+  sleep 0.25
+done
+[ "$(bridge_ssh_child_count "$primary_container" "$docker_remote_socket_path")" = 0 ] \
+  || fail "the bridge left an SSH transport child after its client disconnected"
+
+offline_bundle="$(copy_docker_host_bundle_fixture offline)"
+write_docker_host_fixture_field \
+  "$offline_bundle" \
+  ssh_host \
+  "$offline_docker_host_hostname"
+write_docker_host_fixture_field \
+  "$offline_bundle" \
+  ssh_port \
+  "$offline_docker_host_port"
+start_container \
+  "$offline_container" \
+  "$offline_home_volume" \
+  "$offline_workspace_volume" \
+  "$offline_bundle"
+offline_known_hosts="$fixture_dir/known_hosts.offline"
+offline_port="$(wait_for_ssh "$offline_container" "$offline_known_hosts")"
+assert_container_state_contract "$offline_container"
+assert_bridge_runtime_contract "$offline_container" "$docker_remote_socket_path"
+assert_ssh_docker_environment \
+  "$offline_known_hosts" \
+  "$offline_port" \
+  "$offline_docker_host_hostname" \
+  "offline command SSH session"
+if ssh_command "$offline_known_hosts" "$offline_port" "$fixture_dir/client_key" codex \
+  'timeout --signal=KILL 15 docker info >/dev/null 2>&1'; then
+  fail "Docker unexpectedly reached the deliberately offline SSH target"
+fi
+[ "$(docker inspect --format '{{.State.Running}}' "$offline_container")" = true ] \
+  || fail "an offline Docker target stopped the devbox or blocked SSH readiness"
+for attempt in $(seq 1 60); do
+  if [ "$(bridge_ssh_child_count "$offline_container" "$docker_remote_socket_path")" = 0 ]; then
+    break
+  fi
+  sleep 0.25
+done
+[ "$(bridge_ssh_child_count "$offline_container" "$docker_remote_socket_path")" = 0 ] \
+  || fail "an offline Docker request left an SSH transport child behind"
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   "set -eu; test -w /home/codex; test -w /workspaces; printf '%s' '$state_marker' > /home/codex/.imageyard-smoke-state; printf '%s' '$state_marker' > /workspaces/.imageyard-smoke-state"
@@ -1124,7 +1671,7 @@ ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" cod
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
   set -eu
-  for required_command in node npm python3 pip3 git git-lfs gh ssh docker gcc make curl jq rg fd bwrap ip ss ping lsof nc strace sudo tini; do
+  for required_command in node npm python3 pip3 git git-lfs gh ssh docker gcc make curl jq rg fd bwrap ip ss ping lsof nc strace sudo tini setpriv; do
     command -v "$required_command" >/dev/null
   done
   docker --version >/dev/null
@@ -1194,11 +1741,16 @@ esac
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
   set -eu
-  listener_count="$(ss -H -lnt | wc -l)"
   ssh_listener_count="$(ss -H -lnt "sport = :2222" | wc -l)"
-  test "$listener_count" -gt 0
-  test "$listener_count" -eq "$ssh_listener_count"
-' || fail "container listens on a port other than TCP 2222"
+  docker_dns_listener_count="$(ss -H -lnt | awk '\''$4 ~ /^127\.0\.0\.11:/ { count++ } END { print count + 0 }'\'')"
+  unexpected_listeners="$(ss -H -lnt | awk '\''$4 !~ /:2222$/ && $4 !~ /^127\.0\.0\.11:/ { print }'\'')"
+  if test "$ssh_listener_count" -le 0 \
+    || test "$docker_dns_listener_count" -gt 1 \
+    || test -n "$unexpected_listeners"; then
+    ss -H -lntp >&2
+    exit 1
+  fi
+' || fail "container has an unexpected image-owned TCP listener"
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   'if pgrep -x codex >/dev/null 2>&1; then exit 1; fi'
 
@@ -1217,12 +1769,21 @@ docker exec "$primary_container" /bin/sh -c '
     "permituserenvironment no" \
     "printmotd no" \
     "banner none" \
-    "setenv DOCKER_HOST=$1"; do
-    printf "%s\n" "$effective" | grep -Fxq "$expected_setting"
+    "setenv DOCKER_HOST=$1" \
+    "setenv TESTCONTAINERS_HOST_OVERRIDE=$2" \
+    "setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=$3"; do
+    if ! printf "%s\n" "$effective" | grep -Fxq "$expected_setting"; then
+      printf "missing effective sshd setting: %s\n" "$expected_setting" >&2
+      printf "%s\n" "$effective" | grep -E "^(setenv|port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|allowagentforwarding|allowtcpforwarding|allowstreamlocalforwarding|x11forwarding|permituserenvironment|printmotd|banner) " >&2 || true
+      exit 1
+    fi
   done
   printf "%s\n" "$effective" | grep -Fq "127.0.0.1:*"
   printf "%s\n" "$effective" | grep -Fq "localhost:*"
-' sh "$docker_host_uri" \
+' sh \
+  "$docker_bridge_uri" \
+  "$docker_host_hostname" \
+  "$testcontainers_docker_socket_override" \
   || fail "effective runtime sshd configuration violates the image contract"
 
 if ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/unknown_key" codex true \
@@ -1312,6 +1873,25 @@ done
 [ "$signal_session_ready" = true ] \
   || fail "could not establish an active SSH session for signal testing"
 
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  'exec node -e '"'"'const net=require("node:net");const target=process.env.DOCKER_HOST;const socket=net.createConnection({path:target.slice("unix://".length),allowHalfOpen:true},()=>{socket.write(Buffer.from("POST /hijack HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n"));process.stdout.write("signal-bridge-ready\n");});socket.on("data",()=>{});socket.on("error",()=>process.exit(1));setInterval(()=>{},1000);'"'"'' \
+  >"$fixture_dir/signal-bridge.stdout" 2>"$fixture_dir/signal-bridge.stderr" &
+signal_bridge_pid=$!
+signal_bridge_ready=false
+for attempt in $(seq 1 40); do
+  if ! kill -0 "$signal_bridge_pid" >/dev/null 2>&1; then
+    break
+  fi
+  if grep -Fq signal-bridge-ready "$fixture_dir/signal-bridge.stdout" 2>/dev/null \
+    && [ "$(bridge_ssh_child_count "$primary_container" "$docker_remote_socket_path")" = 1 ]; then
+    signal_bridge_ready=true
+    break
+  fi
+  sleep 0.25
+done
+[ "$signal_bridge_ready" = true ] \
+  || fail "could not establish an active bridge connection for signal testing"
+
 docker stop --time 10 "$primary_container" >/dev/null
 [ "$(docker inspect --format '{{.State.Running}}' "$primary_container")" = false ] \
   || fail "primary container remained running after docker stop"
@@ -1335,13 +1915,34 @@ done
 wait "$signal_session_pid" >/dev/null 2>&1 || true
 signal_session_pid=""
 
-start_container "$restart_container" "$home_volume" "$workspace_volume"
+signal_bridge_exited=false
+for attempt in $(seq 1 20); do
+  if ! kill -0 "$signal_bridge_pid" >/dev/null 2>&1; then
+    signal_bridge_exited=true
+    break
+  fi
+  sleep 0.25
+done
+[ "$signal_bridge_exited" = true ] \
+  || fail "active Docker bridge connection survived the container SIGTERM"
+wait "$signal_bridge_pid" >/dev/null 2>&1 || true
+signal_bridge_pid=""
+assert_log_excludes_key_material "$fixture_dir/signal-bridge.stdout"
+assert_log_excludes_key_material "$fixture_dir/signal-bridge.stderr"
+
+start_container \
+  "$restart_container" \
+  "$home_volume" \
+  "$workspace_volume" \
+  "$fixture_dir/docker-host" \
+  "$docker_backend_network"
 restart_known_hosts="$fixture_dir/known_hosts.restart"
 restart_port="$(wait_for_ssh "$restart_container" "$restart_known_hosts")"
 restart_fingerprint="$(ssh-keygen -E sha256 -lf "$restart_known_hosts" | awk 'NR == 1 { print $2 }')"
 [ "$restart_fingerprint" = "$primary_fingerprint" ] || fail "host fingerprint changed after restart"
 
 assert_container_state_contract "$restart_container"
+assert_bridge_runtime_contract "$restart_container" "$docker_remote_socket_path"
 assert_volume_root_metadata "$home_volume" 1000:1000:700
 assert_volume_root_metadata "$workspace_volume" 1000:1000:700
 assert_seed_preserved "$home_volume" home 123:456 321:654 home-seed-content
@@ -1360,9 +1961,63 @@ assert_volume_top_level_entries \
 [ "$(ssh_command "$restart_known_hosts" "$restart_port" "$fixture_dir/client_key" codex \
   'cat /workspaces/.imageyard-smoke-state')" = "$state_marker" ] \
   || fail "workspace state did not persist across replacement"
-ssh_command "$restart_known_hosts" "$restart_port" "$fixture_dir/client_key" codex \
-  "set -eu; test \"\${DOCKER_HOST-}\" = '$docker_host_uri'; test -z \"\${DOCKER_CONTEXT+x}\"" \
-  || fail "replacement container did not restore the Docker SSH environment"
+assert_ssh_docker_environment \
+  "$restart_known_hosts" \
+  "$restart_port" \
+  "$docker_host_hostname" \
+  "replacement command SSH session"
+restart_daemon_id="$(
+  ssh_command "$restart_known_hosts" "$restart_port" "$fixture_dir/client_key" codex \
+    "docker info --format '{{.ID}}'"
+)" || fail "replacement container could not use the local Docker bridge"
+[ "$restart_daemon_id" = "$fake_docker_daemon_id" ] \
+  || fail "replacement container reached an unexpected fake Docker daemon"
+
+start_container \
+  "$bridge_failure_container" \
+  "$supervision_home_volume" \
+  "$supervision_workspace_volume" \
+  "$fixture_dir/docker-host" \
+  "$docker_backend_network"
+bridge_failure_known_hosts="$fixture_dir/known_hosts.bridge-failure"
+bridge_failure_port="$(wait_for_ssh "$bridge_failure_container" "$bridge_failure_known_hosts")"
+test -n "$bridge_failure_port" || fail "bridge-failure container did not publish SSH"
+assert_bridge_runtime_contract "$bridge_failure_container" "$docker_remote_socket_path"
+bridge_failure_pid="$(container_exact_process_pid \
+  "$bridge_failure_container" \
+  "/usr/local/bin/node /usr/local/libexec/docker-bridge.js $docker_remote_socket_path")" \
+  || fail "could not identify the bridge child for failure supervision"
+docker exec "$bridge_failure_container" kill -TERM "$bridge_failure_pid" >/dev/null \
+  || fail "could not terminate the bridge child for failure supervision"
+wait_for_runtime_failure \
+  "$bridge_failure_container" \
+  "$fixture_dir/bridge-failure.log" \
+  'Docker bridge exited unexpectedly'
+
+start_container \
+  "$sshd_failure_container" \
+  "$supervision_home_volume" \
+  "$supervision_workspace_volume" \
+  "$fixture_dir/docker-host" \
+  "$docker_backend_network"
+sshd_failure_known_hosts="$fixture_dir/known_hosts.sshd-failure"
+sshd_failure_port="$(wait_for_ssh "$sshd_failure_container" "$sshd_failure_known_hosts")"
+test -n "$sshd_failure_port" || fail "sshd-failure container did not publish SSH"
+assert_bridge_runtime_contract "$sshd_failure_container" "$docker_remote_socket_path"
+sshd_failure_supervisor_pid="$(container_exact_process_pid \
+  "$sshd_failure_container" \
+  "/usr/local/bin/node /usr/local/libexec/supervisor.js $docker_remote_socket_path")" \
+  || fail "could not identify the supervisor for OpenSSH failure supervision"
+sshd_failure_pid="$(container_supervised_sshd_pid \
+  "$sshd_failure_container" \
+  "$sshd_failure_supervisor_pid")" \
+  || fail "could not identify the OpenSSH child for failure supervision"
+docker exec "$sshd_failure_container" kill -TERM "$sshd_failure_pid" >/dev/null \
+  || fail "could not terminate the OpenSSH child for failure supervision"
+wait_for_runtime_failure \
+  "$sshd_failure_container" \
+  "$fixture_dir/sshd-failure.log" \
+  'OpenSSH exited unexpectedly'
 
 valid_access_mount="type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly"
 valid_host_mount="type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly"
@@ -1705,7 +2360,11 @@ assert_seed_preserved "$invalid_secret_workspace_volume" invalid-workspaces 456:
 assert_no_probe_leftovers "$invalid_secret_home_volume"
 assert_no_probe_leftovers "$invalid_secret_workspace_volume"
 
-for observed_container in "$primary_container" "$restart_container"; do
+for observed_container in \
+  "$primary_container" \
+  "$restart_container" \
+  "$offline_container" \
+  "$docker_backend_container"; do
   observed_log="$fixture_dir/${observed_container}.log"
   docker logs "$observed_container" >"$observed_log" 2>&1 \
     || fail "could not retrieve logs for $observed_container"

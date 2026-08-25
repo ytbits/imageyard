@@ -21,7 +21,7 @@ permissions:
 
 env:
   EXPECTED_CODEX_VERSION: 0.149.0
-  EXPECTED_IMAGE_TAG: codex-0.149.0-r3
+  EXPECTED_IMAGE_TAG: codex-0.149.0-r4
   EXPECTED_NODE_VERSION: 24.19.0
   EXPECTED_DOCKER_CLI_PACKAGE_VERSION: 5:29.7.2-1~debian.12~bookworm
   EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION: 0.36.1-1~debian.12~bookworm
@@ -42,12 +42,17 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Check shell syntax
+      - name: Check source syntax and bridge behavior
         shell: bash
         run: |
           set -euo pipefail
           sh -n codex-remote-devbox/entrypoint.sh
           bash -n codex-remote-devbox/smoke-test.sh
+          node --check codex-remote-devbox/docker-bridge.js
+          node --check codex-remote-devbox/docker-bridge-client-smoke.js
+          node --check codex-remote-devbox/supervisor.js
+          node --test codex-remote-devbox/docker-bridge.test.js
+          python3 -c 'compile(open("codex-remote-devbox/fake-docker-backend.py", encoding="utf-8").read(), "codex-remote-devbox/fake-docker-backend.py", "exec")'
           git diff --check HEAD^ HEAD
 
       - name: Check workflow YAML syntax
@@ -160,6 +165,12 @@ jobs:
           fi
           if [[ "$smoke_codex_version" != "$EXPECTED_CODEX_VERSION" ]]; then
             echo "::error title=Smoke-test version mismatch::Smoke-test default '${smoke_codex_version}' does not match ${EXPECTED_CODEX_VERSION}"
+            exit 1
+          fi
+          if ! grep -Fxq \
+            "image=\"\${1:-ghcr.io/ytbits/codex-remote-devbox:${EXPECTED_IMAGE_TAG}}\"" \
+            codex-remote-devbox/smoke-test.sh; then
+            echo "::error title=Smoke-test image mismatch::Smoke-test default image does not match ${EXPECTED_IMAGE_TAG}"
             exit 1
           fi
           if [[ "$dockerfile_base_image" != "$EXPECTED_BASE_IMAGE" ]]; then

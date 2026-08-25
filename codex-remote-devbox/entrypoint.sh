@@ -1,7 +1,39 @@
 #!/bin/sh
 set -eu
 
-unset DOCKER_HOST DOCKER_CONTEXT || :
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HOME=/root
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+LOGNAME=root
+SHELL=/bin/bash
+USER=root
+export HOME LANG LC_ALL LOGNAME PATH SHELL USER
+IFS="$(printf ' \t\n_')"
+IFS=${IFS%_}
+umask 077
+
+unset \
+  BASH_ENV \
+  CDPATH \
+  DISPLAY \
+  DOCKER_HOST \
+  DOCKER_CONTEXT \
+  DOCKER_TLS_VERIFY \
+  DOCKER_CERT_PATH \
+  DOCKER_CONFIG \
+  ENV \
+  GLOBIGNORE \
+  LD_LIBRARY_PATH \
+  LD_PRELOAD \
+  TESTCONTAINERS_HOST_OVERRIDE \
+  TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE \
+  NODE_OPTIONS \
+  NODE_PATH \
+  PYTHONHOME \
+  PYTHONPATH \
+  SSH_ASKPASS \
+  SSH_AUTH_SOCK || :
 
 authorized_keys_source=/run/secrets/ssh-access/authorized_keys
 host_key_source=/run/secrets/ssh-host/ssh_host_ed25519_key
@@ -25,8 +57,12 @@ docker_client_key_runtime="$docker_host_runtime_dir/ssh_client_ed25519_private_k
 docker_known_hosts_runtime="$docker_host_runtime_dir/ssh_known_hosts"
 docker_ssh_client_config=/etc/ssh/ssh_config.d/20-codex-docker-host.conf
 runtime_sshd_config="$runtime_dir/sshd_config"
+docker_bridge_socket="$runtime_dir/docker-bridge/docker.sock"
+docker_bridge_host="unix://$docker_bridge_socket"
+testcontainers_docker_socket_override=/var/run/docker.sock
 mountinfo=/proc/self/mountinfo
 state_probe=
+docker_socket_path=
 
 cleanup_state_probe() {
   if [ -n "$state_probe" ]; then
@@ -78,7 +114,7 @@ is_sha256_fingerprint() {
 is_safe_ssh_hostname() {
   case "$1" in
     *:*)
-      printf '%s\n' "$1" | python3 -c '
+      printf '%s\n' "$1" | python3 -I -c '
 import ipaddress
 import sys
 
@@ -222,6 +258,10 @@ validate_effective_docker_ssh_config() {
       check_value("batchmode", $2, "yes")
       next
     }
+    $1 == "connecttimeout" {
+      check_value("connecttimeout", $2, "10")
+      next
+    }
     $1 == "preferredauthentications" {
       check_value("preferredauthentications", $2, "publickey")
       next
@@ -267,6 +307,7 @@ validate_effective_docker_ssh_config() {
           seen["identityfile"] != 1 ||
           seen["identitiesonly"] != 1 ||
           seen["batchmode"] != 1 ||
+          seen["connecttimeout"] != 1 ||
           seen["preferredauthentications"] != 1 ||
           seen["passwordauthentication"] != 1 ||
           seen["kbdinteractiveauthentication"] != 1 ||
@@ -443,8 +484,22 @@ is_sha256_fingerprint "$docker_host_fingerprint" \
   || fail "Docker host key fingerprint is invalid"
 
 install -d -o root -g root -m 0755 /run/sshd
+[ ! -L "$runtime_dir" ] || fail "runtime directory is a symbolic link"
+if [ -e "$runtime_dir" ]; then
+  [ -d "$runtime_dir" ] || fail "runtime path is not a directory"
+fi
 install -d -o root -g root -m 0755 "$runtime_dir"
+[ "$(stat -c '%u:%g:%a' -- "$runtime_dir" 2>/dev/null)" = 0:0:755 ] \
+  || fail "runtime directory metadata validation failed"
+[ ! -L "$docker_host_runtime_dir" ] \
+  || fail "Docker host runtime directory is a symbolic link"
+if [ -e "$docker_host_runtime_dir" ]; then
+  [ -d "$docker_host_runtime_dir" ] \
+    || fail "Docker host runtime path is not a directory"
+fi
 install -d -o root -g root -m 0755 "$docker_host_runtime_dir"
+[ "$(stat -c '%u:%g:%a' -- "$docker_host_runtime_dir" 2>/dev/null)" = 0:0:755 ] \
+  || fail "Docker host runtime directory metadata validation failed"
 install -d -o root -g root -m 0755 /etc/ssh/ssh_config.d
 install -o root -g root -m 0644 "$authorized_keys_source" "$authorized_keys_runtime"
 install -o root -g root -m 0600 "$host_key_source" "$host_key_runtime"
@@ -580,6 +635,7 @@ if ! {
     "  IdentityFile $docker_client_key_runtime" \
     "  IdentitiesOnly yes" \
     "  BatchMode yes" \
+    "  ConnectTimeout 10" \
     "  PreferredAuthentications publickey" \
     "  PasswordAuthentication no" \
     "  KbdInteractiveAuthentication no" \
@@ -608,7 +664,11 @@ fi
 
 install -o root -g root -m 0600 /etc/ssh/sshd_config "$runtime_sshd_config" \
   || fail "could not create OpenSSH runtime configuration"
-if ! printf '\nSetEnv DOCKER_HOST=%s\n' "$docker_host" >> "$runtime_sshd_config"; then
+if ! printf '\nSetEnv DOCKER_HOST=%s TESTCONTAINERS_HOST_OVERRIDE=%s TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=%s\n' \
+  "$docker_bridge_host" \
+  "$docker_ssh_host" \
+  "$testcontainers_docker_socket_override" \
+  >> "$runtime_sshd_config"; then
   fail "could not write OpenSSH runtime configuration"
 fi
 [ "$(stat -c '%u:%g:%a' -- "$runtime_sshd_config" 2>/dev/null)" = 0:0:600 ] \
@@ -621,7 +681,7 @@ for state_root in /home/codex /workspaces; do
   bootstrap_state_root "$state_root"
 done
 
-if ! sudo -n -H -u codex -- /usr/bin/ssh -G "$docker_ssh_alias" 2>/dev/null \
+if ! sudo -n -H -u codex -- /usr/bin/ssh -G -F /etc/ssh/ssh_config "$docker_ssh_alias" 2>/dev/null \
   | validate_effective_docker_ssh_config \
       "$docker_ssh_alias" \
       "$docker_ssh_host" \
@@ -633,4 +693,11 @@ if ! sudo -n -H -u codex -- /usr/bin/ssh -G "$docker_ssh_alias" 2>/dev/null \
 fi
 
 trap - HUP INT TERM
-exec /usr/sbin/sshd -D -e -f "$runtime_sshd_config"
+exec /usr/bin/env -i \
+  HOME=/root \
+  LANG=C.UTF-8 \
+  LOGNAME=root \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  SHELL=/bin/bash \
+  USER=root \
+  /usr/local/bin/node /usr/local/libexec/supervisor.js "$docker_socket_path"
