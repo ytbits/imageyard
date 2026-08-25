@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-24 - Add Supervised Testcontainers Docker Bridge
+
+- Bumped the Codex remote devbox packaging revision to immutable `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4` while retaining Codex CLI `0.149.0`, the exact nine-file Docker-host Secret contract, both state mounts, and the inbound SSH interface.
+- Added an image-owned AF_UNIX bridge at `/run/codex-remote-devbox/docker-bridge/docker.sock`, with a private `1000:1000` mode `0700` directory and `1000:1000` mode `0600` socket, no TCP listener, inode-safe stale-socket handling, and explicit nonzero process exit that preserves detected path replacements through real process teardown.
+- Added one fixed, shell-free `/usr/bin/ssh` plus remote `docker --host=unix://<validated-path> system dial-stdio` transport per connection, with concurrent HTTP, binary hijack, half-close, expected-disconnect, stderr-isolation, and bounded child-reaping behavior.
+- Switched authenticated SSH sessions to the local bridge `DOCKER_HOST` and derived `TESTCONTAINERS_HOST_OVERRIDE` from the validated `ssh_host`, while setting the remote Ryuk bind target through `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` and keeping `DOCKER_CONTEXT` absent.
+- Added a root supervisor that starts the bridge as `codex`, waits for its socket before starting sshd, fails the container if either service exits unexpectedly, and performs bounded signal cleanup without orphan processes or owned stale sockets. Remote Mac or Docker unavailability remains a per-request failure and does not block SSH readiness.
+- Documented the accepted non-isolation boundary: Devboxes sharing the credential use one daemon-wide Mac namespace and resource pool, while Testcontainers and published ports bind on the Mac and remain subject to Docker Desktop, firewall, LAN, and tailnet exposure policy; the local socket adds transport but no Kubernetes Docker TCP endpoint or per-Devbox tenancy.
+- Added focused Node bridge tests plus dual-architecture deterministic fake SSH/dial-stdio smoke coverage for exact argv and session environment, concurrent Docker clients, hijacked streams, offline recovery, hostile Home configuration, process supervision, socket security, and the no-daemon/no-host-socket boundary.
+
 ## 2026-08-24 - Add Pinned Remote Docker Client Layer
 
 - Bumped the Codex remote devbox packaging revision to immutable `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r3` while preserving Codex CLI `0.149.0` and all `r2` state, SSH-server, `tini`, signal, and no-init-container behavior.

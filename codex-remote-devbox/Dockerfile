@@ -1,7 +1,7 @@
 FROM node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
 
 ARG CODEX_VERSION="0.149.0"
-ARG IMAGE_VERSION="codex-0.149.0-r3"
+ARG IMAGE_VERSION="codex-0.149.0-r4"
 ARG DOCKER_CLI_PACKAGE_VERSION="5:29.7.2-1~debian.12~bookworm"
 ARG DOCKER_BUILDX_PACKAGE_VERSION="0.36.1-1~debian.12~bookworm"
 ARG DOCKER_COMPOSE_PACKAGE_VERSION="5.5.0-1~debian.12~bookworm"
@@ -50,7 +50,8 @@ RUN set -eux; \
       ripgrep \
       strace \
       sudo \
-      tini; \
+      tini \
+      util-linux; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl --fail --location --silent --show-error \
       https://download.docker.com/linux/debian/gpg \
@@ -92,6 +93,8 @@ RUN set -eux; \
 
 COPY --chmod=0644 sshd_config /etc/ssh/sshd_config
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/codex-remote-devbox-entrypoint
+COPY --chmod=0755 docker-bridge.js /usr/local/libexec/docker-bridge.js
+COPY --chmod=0755 supervisor.js /usr/local/libexec/supervisor.js
 
 RUN set -eux; \
     test "$(id -u codex)" = 1000; \
@@ -99,6 +102,10 @@ RUN set -eux; \
     test "$(getent passwd codex | cut -d: -f7)" = /bin/bash; \
     test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"; \
     codex app-server --help >/dev/null; \
+    test "$(readlink -f /usr/local/bin/node)" = /usr/local/bin/node; \
+    test -x /usr/bin/setpriv; \
+    node --check /usr/local/libexec/docker-bridge.js; \
+    node --check /usr/local/libexec/supervisor.js; \
     install -d -o root -g root -m 0755 /run/codex-remote-devbox; \
     ssh-keygen -q -t ed25519 -N '' -f /run/codex-remote-devbox/ssh_host_ed25519_key; \
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config; \
