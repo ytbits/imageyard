@@ -31,6 +31,10 @@ imageyard/
 │   ├── entrypoint.sh
 │   ├── fake-docker-backend.py
 │   ├── fake-docker-sshd_config
+│   ├── ghcr-auth-command.sh
+│   ├── ghcr-auth-config.js
+│   ├── ghcr-auth.test.js
+│   ├── ghcr-credential-helper.js
 │   ├── smoke-test.sh
 │   ├── sshd_config
 │   └── supervisor.js
@@ -60,16 +64,17 @@ imageyard/
 - Base image: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
 - Codex CLI package: `@openai/codex@0.149.0`
 - Published platforms: `linux/amd64`, `linux/arm64`
-- Canonical tag: `codex-0.149.0-r4`
-- Release target: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4`
+- Canonical tag: `codex-0.149.0-r5`
+- Release target: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5`
 - Docker client packages: `docker-ce-cli=5:29.7.2-1~debian.12~bookworm`, `docker-buildx-plugin=0.36.1-1~debian.12~bookworm`, and `docker-compose-plugin=5.5.0-1~debian.12~bookworm` from Docker's official Debian repository
 - SSH interface: TCP `2222`, public-key-only login as `codex` UID/GID `1000` with Bash
 - Required state mountpoints: `/home/codex` and `/workspaces`
 - Authorized keys: `/run/secrets/ssh-access/authorized_keys`
 - Ed25519 host key: `/run/secrets/ssh-host/ssh_host_ed25519_key`
 - Docker-host Secret directory: `/run/secrets/docker-host`
+- GHCR credential files: `/run/secrets/ghcr/ghcr_username` and `/run/secrets/ghcr/ghcr_pat`
 - Startup: root `tini` to the validating entrypoint to a root supervisor; the supervisor runs the Docker bridge as `codex` UID/GID `1000` and foreground OpenSSH as root
-- Smoke tests: both architectures, required mountpoints, fresh-volume bootstrap, nested metadata preservation, idempotence, positive and negative SSH authentication, state and secret failure cases, Docker package and remote-SSH contracts, fixed-argv bridge behavior, concurrent HTTP and hijacked streams, offline requests, exact SSH-session environment, supervisor failure and signal cleanup, user and sudo contract, tool boundaries, app-server command availability, stable host identity, persistence, listener checks, and secret non-interference
+- Smoke tests: both architectures, required mountpoints, fresh-volume bootstrap, nested metadata preservation, idempotence, positive and negative SSH authentication, state and secret failure cases, Docker package and remote-SSH contracts, fixed-argv bridge behavior, concurrent HTTP and hijacked streams, offline requests, exact SSH-session environment, GHCR helper protocol and authenticated Docker client requests, hostile Docker Home configuration, deliberate legacy-auth migration and rollback cleanup, supervisor failure and signal cleanup, user and sudo contract, tool boundaries, app-server command availability, stable host identity, persistence, listener checks, and secret non-interference
 
 Both `/home/codex` and `/workspaces` must be real, non-symlink directories and exact mountpoints listed in `/proc/self/mountinfo`; an image-layer directory or parent-only mount is insufficient. The entrypoint validates both mountpoints, the fixed `codex` identity, the SSH inputs, and OpenSSH configuration before changing state. It then non-recursively normalizes only each mount root to UID/GID `1000` and mode `0700`, requires that exact postcondition, and runs a temporary create/remove probe as `codex`. It must never seed, wipe, recursively change, or migrate descendant data. Any invalid, read-only, or unusable root fails closed before SSH starts.
 
@@ -78,6 +83,12 @@ The authorized-keys input accepts bare OpenSSH public-key lines only; per-key op
 The image must fail closed when either runtime SSH key is missing, empty, invalid, or unsafe. It must never generate an ephemeral host identity, print key material, or bake Codex, GitHub, API, SSH, or user credentials into an image layer, build argument, label, or test fixture. Interactive authentication is performed after connection, and persistent user state is an external runtime concern.
 
 The Docker-host Secret directory must provide exactly named regular, non-symlink, nonempty inputs: `docker_host`, `ssh_alias`, `ssh_host`, `ssh_port`, `ssh_user`, `ssh_client_ed25519_private_key`, `ssh_client_ed25519_fingerprint`, `ssh_host_ed25519_fingerprint`, and `ssh_known_hosts`. The SSH alias and OpenSSH host-key alias are fixed to `docker-host`; `HostName` remains the separately configured MagicDNS host. Validate safe field syntax, the Ed25519 client key's derived fingerprint, and exactly one matching Ed25519 known-hosts entry keyed by `docker-host` without printing values or fingerprints. Copy only the private key and known-hosts file on every start to `/run/codex-remote-devbox/docker-host/`, owned by UID/GID `1000` and mode `0600`; never persist them under `/home/codex` or modify `~/.ssh`.
+
+The GHCR Secret contract is exactly two root-owned regular, non-symlink, nonempty source files: `/run/secrets/ghcr/ghcr_username` at mode `0444` and `/run/secrets/ghcr/ghcr_pat` at mode `0400`. Validate a GitHub-compatible username and printable single-line token without printing either value. On every start, recreate `/run/codex-remote-devbox/ghcr/` as UID/GID `1000` mode `0700` with exact files `ghcr_username` and `ghcr_pat` as UID/GID `1000` mode `0600`; never write the PAT, a derived auth value, or a backup containing either into `/home/codex`.
+
+Install the root-owned `docker-credential-codex-ghcr` helper and allow it to return the runtime credential only for normalized `ghcr.io` requests made as UID/GID `1000`. Reject helper writes, erases, unsupported hosts, unsafe runtime metadata, malformed values, and oversized input with one generic non-secret error. The helper exposes all GHCR operations permitted by the supplied PAT and package ACLs, including push when granted; never describe it as pull-only. A GHCR outage or revoked token fails the Docker command at request time and must not become an SSH-readiness gate. Because `codex` has full sudo and the helper must yield the credential to Docker, code running as this trusted user can deliberately extract it; the helper limits accidental persistence and host scope, not exfiltration.
+
+Manage only `credHelpers["ghcr.io"]="codex-ghcr"` in `~/.docker/config.json`. Require a codex-owned, non-symlink directory and single-link regular config file, fatal UTF-8 and valid JSON, and object-valued `auths`/`credHelpers`; normalize the directory and output file to modes `0700` and `0600`. Serialize every image-owned public action through the fixed runtime lock with kernel `flock`, then update through a same-directory single-link mode-`0600` temporary file, file sync, full identity revalidation, atomic rename, and directory sync. At the start of each locked transaction, validate and remove only exact, safe image-named stale temporary files left by a prior image-owned process crash; fail closed on symlinks, hardlinks, wrong ownership/mode, or changed identity. The lock is private to `codex-ghcr-auth`: Docker and arbitrary same-UID editors do not honor it, and POSIX rename provides no compare-and-swap across the residual post-check/pre-rename window. Boot-time enable must therefore run before sshd exposes a session, and manual enable, scrub, or disable requires quiescing `docker login`, `docker logout`, and every other writer of `~/.docker/config.json`; never claim that an uncooperative concurrent writer is preserved. Under that precondition, preserve all unrelated valid JSON. Initial enable must not remove `auths["ghcr.io"]` or overwrite a differently managed helper; remove the legacy auth only through explicit, idempotent `codex-ghcr-auth scrub-legacy-auth` after helper-backed acceptance. Provide exact, idempotent `codex-ghcr-auth disable` rollback cleanup that deletes only the image-managed helper mapping and never prints configuration values.
 
 Generate `/etc/ssh/ssh_config.d/20-codex-docker-host.conf` as a root-owned exact `Host docker-host` stanza with the validated hostname, user, port, `HostKeyAlias docker-host`, runtime identity and known-hosts paths, plus `IdentitiesOnly yes`, `BatchMode yes`, `ConnectTimeout 10`, public-key-only authentication, strict host checking, Ed25519-only host keys, no host-key updates, and no agent forwarding. Validate effective `ssh -G -F /etc/ssh/ssh_config docker-host` output without contacting the host or leaking values. Continue validating `docker_host` as an `ssh://docker-host/<absolute-socket-path>` consistency input; derive the bridge's remote Unix socket path from it, but do not export that URI as `DOCKER_HOST`.
 

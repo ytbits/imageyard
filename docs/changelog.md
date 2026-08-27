@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-26 - Add Runtime GHCR Docker Client Authentication
+
+- Bumped the Codex remote devbox packaging revision to immutable `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5` while preserving Codex CLI `0.149.0`, the remote-Docker bridge, the exact nine-file Docker-host contract, both state mounts, and the inbound SSH interface.
+- Added a fail-closed two-file GHCR source contract at `/run/secrets/ghcr/ghcr_username` and `/run/secrets/ghcr/ghcr_pat`, with root source modes `0444`/`0400` and runtime-only UID/GID `1000` mode-`0600` copies beneath a mode-`0700` `/run/codex-remote-devbox/ghcr/` directory.
+- Added the host-scoped `docker-credential-codex-ghcr` helper so Docker CLI, Buildx, Compose, and Testcontainers registry requests can authenticate through the runtime credential without `docker login`, credential environment variables, or PAT persistence in Home. The helper exposes all GHCR capabilities granted by the supplied PAT and package ACLs and does not make registry availability an SSH-readiness gate.
+- Added kernel-lock-serialized, invalid-UTF-8-, ownership-, symlink-, and hardlink-safe atomic management of only `credHelpers["ghcr.io"]="codex-ghcr"` while preserving unrelated valid Docker configuration and existing legacy GHCR auth under a single-writer contract. Killed image-owned writers leave only strictly named mode-`0600` temporary files that the next locked transaction validates and removes safely. Added explicit idempotent `scrub-legacy-auth` and `disable` operations for post-acceptance migration and staged rollback; neither operation prints or backs up credential values. Documented that Docker and arbitrary same-UID editors do not honor the image-private lock, so startup runs before sshd and manual actions require quiescing every external config writer.
+- Documented the trusted-user boundary: `codex` has full sudo and can deliberately extract a usable runtime credential, while all Devboxes sharing the Mac daemon can observe cached private images. The helper limits accidental persistence and registry scope; it is neither pull-only enforcement nor tenancy isolation.
+- Expanded focused and dual-architecture smoke coverage for helper protocol, deterministic authenticated remote-Docker requests, hostile/malformed/symlink Home configuration, exact merge/scrub/disable semantics, kernel serialization of image-owned actions, pre-rename replacement detection, crash recovery, source/runtime modes, missing and malformed Secret inputs, restart/signal contracts, and absence of PAT material from Home, state, image layers, history, and logs.
+
 ## 2026-08-24 - Add Supervised Testcontainers Docker Bridge
 
 - Bumped the Codex remote devbox packaging revision to immutable `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4` while retaining Codex CLI `0.149.0`, the exact nine-file Docker-host Secret contract, both state mounts, and the inbound SSH interface.

@@ -19,6 +19,7 @@ const {
   bridgeLaunch,
   closePromise,
   removeStaleSocket,
+  validateGhcrRuntime,
   waitWithTimeout,
 } = require('./supervisor.js');
 
@@ -146,6 +147,30 @@ test('supervisor launch clears supplementary groups, ambient state, and privileg
     ),
     /privilege state is invalid/,
   );
+});
+
+test('supervisor validates the runtime-only GHCR credential metadata contract', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'imageyard-ghcr-supervisor-test-'));
+  const runtime = path.join(root, 'ghcr');
+  const uid = process.getuid();
+  const gid = process.getgid();
+  try {
+    fs.mkdirSync(runtime, { mode: 0o700 });
+    fs.chmodSync(runtime, 0o700);
+    for (const name of ['ghcr_username', 'ghcr_pat']) {
+      fs.writeFileSync(path.join(runtime, name), 'runtime-only-fixture', { mode: 0o600 });
+      fs.chmodSync(path.join(runtime, name), 0o600);
+    }
+    assert.doesNotThrow(() => validateGhcrRuntime(runtime, uid, gid));
+
+    fs.chmodSync(path.join(runtime, 'ghcr_pat'), 0o644);
+    assert.throws(() => validateGhcrRuntime(runtime, uid, gid), /credential is invalid/);
+    fs.chmodSync(path.join(runtime, 'ghcr_pat'), 0o600);
+    fs.writeFileSync(path.join(runtime, 'unexpected'), 'x', { mode: 0o600 });
+    assert.throws(() => validateGhcrRuntime(runtime, uid, gid), /unexpected object/);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test('child close tracking does not confuse exit with completed process cleanup', async () => {

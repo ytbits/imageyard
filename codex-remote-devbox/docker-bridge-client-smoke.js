@@ -81,7 +81,7 @@ async function main() {
   const info = await request('/info');
   assert.equal(info.statusCode, 200);
   const daemonId = JSON.parse(info.body.toString('utf8')).ID;
-  assert.equal(daemonId, 'IMAGEYARD-R4-FAKE-DAEMON-ID');
+  assert.equal(daemonId, 'IMAGEYARD-R5-FAKE-DAEMON-ID');
 
   const binary = Buffer.from([0, 1, 2, 10, 13, 127, 128, 255]);
   const hijack = await upgraded('/hijack', binary);

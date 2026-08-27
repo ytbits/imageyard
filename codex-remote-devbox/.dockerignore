@@ -2,5 +2,8 @@
 !Dockerfile
 !docker-bridge.js
 !entrypoint.sh
+!ghcr-auth-command.sh
+!ghcr-auth-config.js
+!ghcr-credential-helper.js
 !sshd_config
 !supervisor.js

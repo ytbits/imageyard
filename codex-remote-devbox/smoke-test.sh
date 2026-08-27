@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4}"
+image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5}"
 expected_codex_version="${EXPECTED_CODEX_VERSION:-0.149.0}"
 expected_docker_ce_cli_version="${EXPECTED_DOCKER_CLI_PACKAGE_VERSION:-5:29.7.2-1~debian.12~bookworm}"
 expected_docker_buildx_version="${EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION:-0.36.1-1~debian.12~bookworm}"
@@ -12,6 +12,9 @@ expected_docker_buildx_semver="${EXPECTED_DOCKER_BUILDX_SEMVER:-0.36.1}"
 expected_docker_compose_semver="${EXPECTED_DOCKER_COMPOSE_SEMVER:-5.5.0}"
 secret_marker="IMAGEYARD_SMOKE_SECRET_DO_NOT_BAKE_7e4fdd65"
 docker_secret_marker="IMAGEYARD_DOCKER_HOST_SECRET_DO_NOT_PERSIST_903ea3d1"
+ghcr_pat_marker="ghp_IMAGEYARD_GHCR_RUNTIME_ONLY_SECRET_51f3d92a"
+legacy_ghcr_auth_marker="IMAGEYARD_LEGACY_GHCR_AUTH_PRESERVE_THEN_SCRUB_67b2c8a0"
+ghcr_username="imageyard-smoke"
 state_marker="IMAGEYARD_SMOKE_STATE_PERSISTS_b91c6c82"
 docker_host_alias="docker-host"
 docker_host_hostname="imageyard-fake-docker-host"
@@ -22,8 +25,10 @@ docker_remote_socket_path="/Users/imageyard/.docker/run/docker.sock"
 docker_bridge_runtime_dir="/run/codex-remote-devbox/docker-bridge"
 docker_bridge_socket="$docker_bridge_runtime_dir/docker.sock"
 docker_bridge_uri="unix://$docker_bridge_socket"
+ghcr_runtime_dir="/run/codex-remote-devbox/ghcr"
+ghcr_pull_image="ghcr.io/ytbits/imageyard-private-smoke:fixture"
 testcontainers_docker_socket_override="/var/run/docker.sock"
-fake_docker_daemon_id="IMAGEYARD-R4-FAKE-DAEMON-ID"
+fake_docker_daemon_id="IMAGEYARD-R5-FAKE-DAEMON-ID"
 offline_docker_host_hostname="127.0.0.1"
 offline_docker_host_port="1"
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-remote-devbox-smoke.XXXXXX")"
@@ -58,6 +63,8 @@ symlink_home_container="${name_prefix}-symlink-home"
 symlink_workspace_container="${name_prefix}-symlink-workspace"
 readonly_home_container="${name_prefix}-readonly-home"
 readonly_workspace_container="${name_prefix}-readonly-workspace"
+malformed_docker_config_container="${name_prefix}-malformed-docker-config"
+symlink_docker_config_container="${name_prefix}-symlink-docker-config"
 
 home_volume="${name_prefix}-home"
 workspace_volume="${name_prefix}-workspaces"
@@ -72,6 +79,10 @@ readonly_workspace_volume="${name_prefix}-readonly-workspaces"
 invalid_secret_home_volume="${name_prefix}-invalid-secret-home"
 invalid_secret_workspace_volume="${name_prefix}-invalid-secret-workspaces"
 parent_home_volume="${name_prefix}-parent-home"
+malformed_config_home_volume="${name_prefix}-malformed-config-home"
+malformed_config_workspace_volume="${name_prefix}-malformed-config-workspaces"
+symlink_config_home_volume="${name_prefix}-symlink-config-home"
+symlink_config_workspace_volume="${name_prefix}-symlink-config-workspaces"
 
 declare -a cleanup_containers=(
   "$primary_container"
@@ -101,11 +112,14 @@ declare -a cleanup_containers=(
   "$symlink_workspace_container"
   "$readonly_home_container"
   "$readonly_workspace_container"
+  "$malformed_docker_config_container"
+  "$symlink_docker_config_container"
 )
 declare -a cleanup_volumes=()
 declare -a secret_source_files=()
 declare -a docker_host_source_files=()
 declare -a sensitive_docker_host_files=()
+declare -a ghcr_source_files=()
 forward_pid=""
 signal_session_pid=""
 bridge_hold_pid=""
@@ -178,11 +192,23 @@ trap 'exit 143' TERM
   || fail "state and Docker host secret markers must be distinct"
 [ "$secret_marker" != "$docker_secret_marker" ] \
   || fail "SSH and Docker host secret markers must be distinct"
+[ "$ghcr_pat_marker" != "$secret_marker" ] \
+  || fail "SSH and GHCR secret markers must be distinct"
+[ "$ghcr_pat_marker" != "$docker_secret_marker" ] \
+  || fail "Docker host and GHCR secret markers must be distinct"
+[ "$ghcr_pat_marker" != "$legacy_ghcr_auth_marker" ] \
+  || fail "runtime and legacy GHCR markers must be distinct"
 
-for command_name in cksum cmp docker ssh ssh-keygen ssh-keyscan stat; do
+for command_name in base64 cksum cmp docker ssh ssh-keygen ssh-keyscan stat; do
   command -v "$command_name" >/dev/null 2>&1 \
     || fail "required host command is unavailable: $command_name"
 done
+
+legacy_ghcr_auth_encoded="$(
+  printf '%s' "ytbits:$legacy_ghcr_auth_marker" | base64 | tr -d '\n'
+)"
+[ -n "$legacy_ghcr_auth_encoded" ] \
+  || fail "could not create the legacy GHCR auth fixture"
 
 docker image inspect "$image" >/dev/null 2>&1 \
   || fail "image is not available locally: $image"
@@ -197,6 +223,7 @@ mkdir -p \
   "$fixture_dir/access" \
   "$fixture_dir/host" \
   "$fixture_dir/docker-host" \
+  "$fixture_dir/ghcr" \
   "$fixture_dir/docker-backend"
 
 ssh-keygen -q -t ed25519 -N '' -C "$secret_marker" -f "$fixture_dir/client_key"
@@ -294,6 +321,15 @@ chmod 0444 \
   "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint" \
   "$fixture_dir/docker-host/ssh_known_hosts"
 
+printf '%s' "$ghcr_username" > "$fixture_dir/ghcr/ghcr_username"
+printf '%s' "$ghcr_pat_marker" > "$fixture_dir/ghcr/ghcr_pat"
+chmod 0444 "$fixture_dir/ghcr/ghcr_username"
+chmod 0400 "$fixture_dir/ghcr/ghcr_pat"
+printf '%s\n' \
+  "{\"username\":\"$ghcr_username\",\"secret\":\"$ghcr_pat_marker\"}" \
+  > "$fixture_dir/docker-backend/expected-ghcr-auth.json"
+chmod 0444 "$fixture_dir/docker-backend/expected-ghcr-auth.json"
+
 cp "$fixture_dir/docker_remote_host_key" \
   "$fixture_dir/docker-backend/ssh_host_ed25519_key"
 cp "$fixture_dir/docker_client_key.pub" \
@@ -315,6 +351,7 @@ secret_source_files=(
   "$fixture_dir/invalid_host_key"
   "$fixture_dir/docker-backend/authorized_keys"
   "$fixture_dir/docker-backend/ssh_host_ed25519_key"
+  "$fixture_dir/docker-backend/expected-ghcr-auth.json"
 )
 docker_host_source_files=(
   "$fixture_dir/docker-host/docker_host"
@@ -334,6 +371,10 @@ sensitive_docker_host_files=(
   "$fixture_dir/docker-host/ssh_host_ed25519_fingerprint"
   "$fixture_dir/docker-host/ssh_known_hosts"
 )
+ghcr_source_files=(
+  "$fixture_dir/ghcr/ghcr_username"
+  "$fixture_dir/ghcr/ghcr_pat"
+)
 authorized_key_material="$(awk 'NR == 1 { print $1 " " $2 }' "$fixture_dir/access/authorized_keys")"
 host_public_key_material="$(ssh-keygen -y -f "$fixture_dir/host/ssh_host_ed25519_key")"
 [ -n "$authorized_key_material" ] || fail "could not derive the authorized public key fixture"
@@ -345,7 +386,8 @@ record_secret_sources() {
 
   for source_file in \
     "${secret_source_files[@]}" \
-    "${docker_host_source_files[@]}"; do
+    "${docker_host_source_files[@]}" \
+    "${ghcr_source_files[@]}"; do
     cksum "$source_file"
     if source_metadata="$(stat -f '%u:%g:%Lp:%m' "$source_file" 2>/dev/null)"; then
       :
@@ -492,6 +534,65 @@ assert_legacy_home_ssh_config_preserved() {
   fi
 }
 
+seed_legacy_home_docker_config() {
+  local volume_name="$1"
+
+  if ! state_volume_run "$volume_name" '
+    set -eu
+    install -d -o 1000 -g 1000 -m 0755 /state/.docker
+    printf "%s\n" \
+      "{\"auths\":{\"ghcr.io\":{\"auth\":\"$1\"},\"registry.example.test\":{\"auth\":\"dW5yZWxhdGVkOnByZXNlcnZlZA==\"}},\"credHelpers\":{\"registry.example.test\":\"pass\"},\"currentContext\":\"preserved-context\",\"plugins\":{\"buildx\":{\"enabled\":\"true\"}}}" \
+      > /state/.docker/config.json
+    chown 1000:1000 /state/.docker/config.json
+    chmod 0644 /state/.docker/config.json
+  ' "$legacy_ghcr_auth_encoded"; then
+    fail "could not seed the legacy Home Docker configuration"
+  fi
+}
+
+assert_home_docker_config_enabled() {
+  local volume_name="$1"
+  local expected_legacy_state="$2"
+
+  if ! state_volume_run "$volume_name" '
+    set -eu
+    expected_legacy_state=$1
+    legacy_auth=$2
+    runtime_pat=$3
+    config=/state/.docker/config.json
+    test ! -L /state/.docker
+    test ! -L "$config"
+    test "$(stat -c "%u:%g:%a" -- /state/.docker)" = 1000:1000:700
+    test "$(stat -c "%u:%g:%a" -- "$config")" = 1000:1000:600
+    jq -e \
+      --arg legacy "$legacy_auth" \
+      --arg expected "$expected_legacy_state" \
+      '\''
+        .credHelpers["ghcr.io"] == "codex-ghcr" and
+        .credHelpers["registry.example.test"] == "pass" and
+        .auths["registry.example.test"].auth == "dW5yZWxhdGVkOnByZXNlcnZlZA==" and
+        .currentContext == "preserved-context" and
+        .plugins.buildx.enabled == "true" and
+        (if $expected == "present" then .auths["ghcr.io"].auth == $legacy else (.auths | has("ghcr.io") | not) end)
+      '\'' "$config" >/dev/null
+    if grep -Fq -- "$runtime_pat" "$config"; then
+      exit 1
+    fi
+  ' "$expected_legacy_state" "$legacy_ghcr_auth_encoded" "$ghcr_pat_marker"; then
+    fail "Home Docker configuration does not preserve the managed GHCR contract"
+  fi
+}
+
+record_home_docker_config_metadata() {
+  local volume_name="$1"
+
+  state_volume_run "$volume_name" '
+    set -eu
+    stat -c "%i:%s:%Y:%a:%u:%g" -- /state/.docker/config.json
+    sha256sum /state/.docker/config.json
+  '
+}
+
 assert_seed_preserved() {
   local volume_name="$1"
   local label="$2"
@@ -598,8 +699,9 @@ assert_state_excludes_secret_marker() {
     "$docker_remote_host_public_key_material" \
     "$docker_client_fingerprint" \
     "$docker_remote_host_fingerprint" \
-    "$docker_host_uri"; then
-    fail "state volume $volume_name contains runtime SSH or Docker host material"
+    "$docker_host_uri" \
+    "$ghcr_pat_marker"; then
+    fail "state volume $volume_name contains runtime SSH, Docker host, or GHCR material"
   fi
 }
 
@@ -616,7 +718,11 @@ for volume_name in \
   "$readonly_workspace_volume" \
   "$invalid_secret_home_volume" \
   "$invalid_secret_workspace_volume" \
-  "$parent_home_volume"; do
+  "$parent_home_volume" \
+  "$malformed_config_home_volume" \
+  "$malformed_config_workspace_volume" \
+  "$symlink_config_home_volume" \
+  "$symlink_config_workspace_volume"; do
   create_state_volume "$volume_name"
 done
 
@@ -633,8 +739,27 @@ fi
 seed_state_volume "$home_volume" home 123:456 321:654 home-seed-content
 seed_state_volume "$workspace_volume" workspaces 234:567 432:765 workspace-seed-content
 seed_legacy_home_ssh_config "$home_volume"
+seed_legacy_home_docker_config "$home_volume"
 seed_state_volume "$invalid_secret_home_volume" invalid-home 345:678 543:876 invalid-home-seed
 seed_state_volume "$invalid_secret_workspace_volume" invalid-workspaces 456:789 654:987 invalid-workspace-seed
+
+if ! state_volume_run "$malformed_config_home_volume" '
+  set -eu
+  install -d -o 1000 -g 1000 -m 0700 /state/.docker
+  printf "%s\n" "{not-json" > /state/.docker/config.json
+  chown 1000:1000 /state/.docker/config.json
+  chmod 0600 /state/.docker/config.json
+'; then
+  fail "could not seed the malformed Docker config fixture"
+fi
+if ! state_volume_run "$symlink_config_home_volume" '
+  set -eu
+  install -d -o 1000 -g 1000 -m 0700 /state/.docker
+  ln -s /dev/null /state/.docker/config.json
+  chown -h 1000:1000 /state/.docker/config.json
+'; then
+  fail "could not seed the symlink Docker config fixture"
+fi
 
 start_container() {
   local container_name="$1"
@@ -656,6 +781,7 @@ start_container() {
     --mount "type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
     --mount "type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
     --mount "type=bind,src=$docker_host_bundle,dst=/run/secrets/docker-host,readonly" \
+    --mount "type=bind,src=$fixture_dir/ghcr,dst=/run/secrets/ghcr,readonly" \
     --mount "type=volume,src=$container_home_volume,dst=/home/codex,volume-nocopy" \
     --mount "type=volume,src=$container_workspace_volume,dst=/workspaces,volume-nocopy" \
     "$image" >/dev/null
@@ -997,7 +1123,8 @@ assert_log_excludes_key_material() {
     "$docker_remote_host_public_key_material" \
     "$docker_client_fingerprint" \
     "$docker_remote_host_fingerprint" \
-    "$docker_host_uri"; do
+    "$docker_host_uri" \
+    "$ghcr_pat_marker"; do
     grep_status=0
     grep -Fq -- "$forbidden_material" "$log_file" >/dev/null 2>&1 || grep_status=$?
     case "$grep_status" in
@@ -1026,6 +1153,18 @@ assert_log_excludes_key_material() {
       0) fail "log contains Docker host fixture material: $log_file" ;;
       1) ;;
       *) fail "could not scan log for Docker host fixture material: $log_file" ;;
+    esac
+  done
+
+
+  for source_file in "${ghcr_source_files[@]}"; do
+    [ -s "$source_file" ] || continue
+    grep_status=0
+    grep -F -f "$source_file" "$log_file" >/dev/null 2>&1 || grep_status=$?
+    case "$grep_status" in
+      0) fail "log contains GHCR Secret material: $log_file" ;;
+      1) ;;
+      *) fail "could not scan log for GHCR Secret material: $log_file" ;;
     esac
   done
 }
@@ -1066,13 +1205,16 @@ expect_start_failure() {
   local log_file="$2"
   local expected_log="$3"
   local docker_bundle_mount
+  local ghcr_bundle_mount
   shift 3
 
   docker_bundle_mount="${docker_host_failure_mount:-type=bind,src=$fixture_dir/docker-host,dst=/run/secrets/docker-host,readonly}"
+  ghcr_bundle_mount="${ghcr_failure_mount:-type=bind,src=$fixture_dir/ghcr,dst=/run/secrets/ghcr,readonly}"
 
   if ! docker run --detach \
     --name "$container_name" \
     --mount "$docker_bundle_mount" \
+    --mount "$ghcr_bundle_mount" \
     "$@" \
     "$image" \
     > /dev/null 2>"$log_file"; then
@@ -1091,6 +1233,7 @@ expect_state_type_failure() {
   local expected_log
   local wrapper
   local docker_bundle_mount
+  local ghcr_bundle_mount
 
   case "$state_type" in
     missing)
@@ -1111,10 +1254,12 @@ expect_state_type_failure() {
   esac
 
   docker_bundle_mount="${docker_host_failure_mount:-type=bind,src=$fixture_dir/docker-host,dst=/run/secrets/docker-host,readonly}"
+  ghcr_bundle_mount="${ghcr_failure_mount:-type=bind,src=$fixture_dir/ghcr,dst=/run/secrets/ghcr,readonly}"
 
   if ! docker run --detach \
     --name "$container_name" \
     --mount "$docker_bundle_mount" \
+    --mount "$ghcr_bundle_mount" \
     "$@" \
     --entrypoint /bin/sh \
     "$image" \
@@ -1199,6 +1344,61 @@ expect_docker_host_bundle_failure() {
   done
 }
 
+copy_ghcr_bundle_fixture() {
+  local fixture_name="$1"
+  local destination="$fixture_dir/ghcr-$fixture_name"
+
+  mkdir -p "$destination"
+  cp -a "$fixture_dir/ghcr/." "$destination/"
+  printf '%s\n' "$destination"
+}
+
+write_ghcr_fixture_field() {
+  local bundle_dir="$1"
+  local field_name="$2"
+  local field_value="$3"
+  local field_mode=0444
+
+  if [ "$field_name" = ghcr_pat ]; then
+    field_mode=0400
+  fi
+  chmod u+w "$bundle_dir/$field_name"
+  printf '%s' "$field_value" > "$bundle_dir/$field_name"
+  chmod "$field_mode" "$bundle_dir/$field_name"
+}
+
+expect_ghcr_bundle_failure() {
+  local fixture_name="$1"
+  local bundle_dir="$2"
+  local expected_log="$3"
+  local container_name="${name_prefix}-ghcr-${fixture_name}"
+  local log_file="$fixture_dir/ghcr-${fixture_name}.log"
+
+  cleanup_containers+=("$container_name")
+  ghcr_failure_mount="type=bind,src=$bundle_dir,dst=/run/secrets/ghcr,readonly" \
+    expect_start_failure \
+      "$container_name" \
+      "$log_file" \
+      "$expected_log" \
+      --network none \
+      --mount "type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
+      --mount "type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
+      --mount "type=volume,src=$support_home_volume,dst=/home/codex,volume-nocopy" \
+      --mount "type=volume,src=$support_workspace_volume,dst=/workspaces,volume-nocopy"
+
+  if [ -f "$bundle_dir/ghcr_pat" ] \
+    && [ ! -L "$bundle_dir/ghcr_pat" ] \
+    && [ -s "$bundle_dir/ghcr_pat" ]; then
+    grep_status=0
+    LC_ALL=C grep -F -f "$bundle_dir/ghcr_pat" "$log_file" >/dev/null 2>&1 || grep_status=$?
+    case "$grep_status" in
+      0) fail "$container_name printed GHCR PAT material" ;;
+      1) ;;
+      *) fail "could not scan $container_name logs for GHCR PAT material" ;;
+    esac
+  fi
+}
+
 assert_container_state_contract() {
   local container_name="$1"
 
@@ -1218,7 +1418,8 @@ assert_container_state_contract() {
 
 docker image inspect "$image" > "$fixture_dir/image-inspect.json"
 if grep -Fq "$secret_marker" "$fixture_dir/image-inspect.json" \
-  || grep -Fq "$docker_secret_marker" "$fixture_dir/image-inspect.json"; then
+  || grep -Fq "$docker_secret_marker" "$fixture_dir/image-inspect.json" \
+  || grep -Fq "$ghcr_pat_marker" "$fixture_dir/image-inspect.json"; then
   fail "image metadata contains the smoke-test secret marker"
 fi
 if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
@@ -1227,7 +1428,8 @@ if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$i
 fi
 docker history --no-trunc "$image" > "$fixture_dir/image-history.txt"
 if grep -Fq "$secret_marker" "$fixture_dir/image-history.txt" \
-  || grep -Fq "$docker_secret_marker" "$fixture_dir/image-history.txt"; then
+  || grep -Fq "$docker_secret_marker" "$fixture_dir/image-history.txt" \
+  || grep -Fq "$ghcr_pat_marker" "$fixture_dir/image-history.txt"; then
   fail "image history contains the smoke-test secret marker"
 fi
 
@@ -1249,12 +1451,12 @@ if ! docker run --rm \
     if find /etc/ssh /home/codex /root /run -type f -exec grep -I -l -E "^-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----" {} + 2>/dev/null | grep -q .; then
       exit 1
     fi
-    for forbidden_material in "$1" "$2"; do
+    for forbidden_material in "$@"; do
       if grep -R -F -l "$forbidden_material" /etc /home /root /run /usr/local 2>/dev/null | grep -q .; then
         exit 1
       fi
     done
-  ' sh "$secret_marker" "$docker_secret_marker"; then
+  ' sh "$secret_marker" "$docker_secret_marker" "$ghcr_pat_marker"; then
   fail "image filesystem contains credential material or the smoke-test marker"
 fi
 
@@ -1281,7 +1483,7 @@ primary_fingerprint="$(ssh-keygen -E sha256 -lf "$primary_known_hosts" | awk 'NR
   || fail "image exposes a port other than TCP 2222"
 
 actual_mounts="$(docker inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$primary_container" | sed '/^$/d' | sort)"
-expected_mounts="$(printf '%s\n' /home/codex /run/secrets/docker-host /run/secrets/ssh-access/authorized_keys /run/secrets/ssh-host/ssh_host_ed25519_key /workspaces | sort)"
+expected_mounts="$(printf '%s\n' /home/codex /run/secrets/docker-host /run/secrets/ghcr /run/secrets/ssh-access/authorized_keys /run/secrets/ssh-host/ssh_host_ed25519_key /workspaces | sort)"
 [ "$actual_mounts" = "$expected_mounts" ] \
   || fail "container uses unexpected mounts: $(printf '%s' "$actual_mounts" | paste -sd, -)"
 [ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/codex"}}{{.Type}}:{{.Name}}{{end}}{{end}}' "$primary_container")" = "volume:$home_volume" ] \
@@ -1290,6 +1492,8 @@ expected_mounts="$(printf '%s\n' /home/codex /run/secrets/docker-host /run/secre
   || fail "workspace state is not backed by the expected named volume"
 [ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/docker-host"}}{{.Type}}:{{.RW}}{{end}}{{end}}' "$primary_container")" = bind:false ] \
   || fail "Docker host Secret is not a read-only bind mount"
+[ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/ghcr"}}{{.Type}}:{{.RW}}{{end}}{{end}}' "$primary_container")" = bind:false ] \
+  || fail "GHCR Secret is not a read-only bind mount"
 
 assert_container_state_contract "$primary_container"
 assert_volume_root_metadata "$home_volume" 1000:1000:700
@@ -1297,9 +1501,10 @@ assert_volume_root_metadata "$workspace_volume" 1000:1000:700
 assert_seed_preserved "$home_volume" home 123:456 321:654 home-seed-content
 assert_seed_preserved "$workspace_volume" workspaces 234:567 432:765 workspace-seed-content
 assert_legacy_home_ssh_config_preserved "$home_volume"
+assert_home_docker_config_enabled "$home_volume" present
 assert_no_probe_leftovers "$home_volume"
 assert_no_probe_leftovers "$workspace_volume"
-assert_volume_top_level_entries "$home_volume" .ssh seed-home
+assert_volume_top_level_entries "$home_volume" .docker .ssh seed-home
 assert_volume_top_level_entries "$workspace_volume" seed-workspaces
 
 docker exec "$primary_container" /bin/sh -c '
@@ -1426,6 +1631,115 @@ docker exec "$primary_container" /bin/sh -c '
   "$testcontainers_docker_socket_override" \
   "$docker_host_uri"
 
+assert_home_docker_config_enabled "$home_volume" present
+
+docker exec "$primary_container" /bin/sh -c '
+  set -eu
+  source_dir=/run/secrets/ghcr
+  runtime_dir=/run/codex-remote-devbox/ghcr
+  runtime_pat_marker=$1
+
+  test -d "$source_dir"
+  test ! -L "$source_dir"
+  awk -v expected="$source_dir" '\''
+    $5 == expected && $6 ~ /(^|,)ro(,|$)/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '\'' /proc/self/mountinfo
+  for source_name in ghcr_username ghcr_pat; do
+    source_file="$source_dir/$source_name"
+    test -f "$source_file"
+    test ! -L "$source_file"
+    test -s "$source_file"
+    expected_mode=444
+    if test "$source_name" = ghcr_pat; then
+      expected_mode=400
+    fi
+    test "$(stat -c "%u:%g:%a" -- "$source_file")" = "0:0:$expected_mode"
+    if sudo -n -u codex -- test -w "$source_file"; then
+      exit 1
+    fi
+  done
+
+  test ! -L "$runtime_dir"
+  test "$(stat -c "%u:%g:%a" -- "$runtime_dir")" = 1000:1000:700
+  test "$(find "$runtime_dir" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr "\n" " ")" = "ghcr_pat ghcr_username "
+  for runtime_name in ghcr_username ghcr_pat; do
+    runtime_file="$runtime_dir/$runtime_name"
+    test -f "$runtime_file"
+    test ! -L "$runtime_file"
+    test "$(stat -c "%u:%g:%a:%h" -- "$runtime_file")" = 1000:1000:600:1
+    cmp "$source_dir/$runtime_name" "$runtime_file"
+  done
+  test "$(stat -c "%u:%g:%a" -- /usr/local/bin/docker-credential-codex-ghcr)" = 0:0:755
+  test "$(stat -c "%u:%g:%a" -- /usr/local/bin/codex-ghcr-auth)" = 0:0:755
+  test "$(stat -c "%u:%g:%a" -- /usr/local/libexec/ghcr-auth-config.js)" = 0:0:644
+  test "$(stat -c "%u:%g:%a:%h" -- /run/codex-remote-devbox/ghcr-auth.lock)" = 1000:1000:600:1
+
+  printf "%s" ghcr.io \
+    | sudo -n -u codex -- /usr/local/bin/docker-credential-codex-ghcr get \
+    | sudo -n -u codex -- node -e '\''
+      const fs = require("node:fs");
+      const chunks = [];
+      process.stdin.on("data", (chunk) => chunks.push(chunk));
+      process.stdin.on("end", () => {
+        const actual = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const username = fs.readFileSync("/run/codex-remote-devbox/ghcr/ghcr_username", "ascii");
+        const secret = fs.readFileSync("/run/codex-remote-devbox/ghcr/ghcr_pat", "ascii");
+        if (actual.Username !== username || actual.Secret !== secret) process.exit(1);
+      });
+    '\''
+  printf "%s" "{}" \
+    | sudo -n -u codex -- /usr/local/bin/docker-credential-codex-ghcr store \
+      > /tmp/ghcr-helper.stdout 2> /tmp/ghcr-helper.stderr \
+    && exit 1
+  test ! -s /tmp/ghcr-helper.stdout
+  grep -Fxq "docker-credential-codex-ghcr: credential operation failed" /tmp/ghcr-helper.stderr
+  if grep -Fq -- "$runtime_pat_marker" /tmp/ghcr-helper.stderr; then
+    exit 1
+  fi
+  rm -f /tmp/ghcr-helper.stdout /tmp/ghcr-helper.stderr
+
+  assert_helper_failure() {
+    input_file=$1
+    shift
+    set +e
+    "$@" < "$input_file" \
+      > /tmp/ghcr-helper.stdout 2> /tmp/ghcr-helper.stderr
+    helper_status=$?
+    set -e
+    test "$helper_status" -ne 0
+    test ! -s /tmp/ghcr-helper.stdout
+    grep -Fxq "docker-credential-codex-ghcr: credential operation failed" \
+      /tmp/ghcr-helper.stderr
+    if grep -Fq -- "$runtime_pat_marker" /tmp/ghcr-helper.stderr; then
+      exit 1
+    fi
+    rm -f /tmp/ghcr-helper.stdout /tmp/ghcr-helper.stderr "$input_file"
+  }
+
+  printf "%s" docker.io > /tmp/ghcr-helper.input
+  assert_helper_failure \
+    /tmp/ghcr-helper.input \
+    sudo -n -u codex -- /usr/local/bin/docker-credential-codex-ghcr get
+
+  printf "%s" ghcr.io > /tmp/ghcr-helper.input
+  assert_helper_failure \
+    /tmp/ghcr-helper.input \
+    /usr/local/bin/docker-credential-codex-ghcr get
+
+  head -c 1048576 /dev/zero | tr "\\000" x > /tmp/ghcr-helper.input
+  assert_helper_failure \
+    /tmp/ghcr-helper.input \
+    sudo -n -u codex -- /usr/local/bin/docker-credential-codex-ghcr get
+
+  chmod 0644 "$runtime_dir/ghcr_pat"
+  printf "%s" ghcr.io > /tmp/ghcr-helper.input
+  assert_helper_failure \
+    /tmp/ghcr-helper.input \
+    sudo -n -u codex -- /usr/local/bin/docker-credential-codex-ghcr get
+  chmod 0600 "$runtime_dir/ghcr_pat"
+' sh "$ghcr_pat_marker"
+
 clean_stdout="$(ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   "printf '%s' codex-smoke-output" 2>"$fixture_dir/ssh.stderr")"
 [ "$clean_stdout" = codex-smoke-output ] || fail "noninteractive SSH stdout contains a banner or MOTD"
@@ -1504,6 +1818,70 @@ cli_daemon_id="$(
 )" || fail "Docker CLI could not use the local Unix bridge"
 [ "$cli_daemon_id" = "$client_daemon_id" ] \
   || fail "Docker CLI and the bridge client reached different daemon IDs"
+
+if ! ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  "docker pull '$ghcr_pull_image'" \
+  > "$fixture_dir/ghcr-pull.stdout" 2> "$fixture_dir/ghcr-pull.stderr"; then
+  cat "$fixture_dir/ghcr-pull.stderr" >&2
+  fail "Docker CLI could not authenticate the deterministic private GHCR pull"
+fi
+assert_log_excludes_key_material "$fixture_dir/ghcr-pull.stdout"
+assert_log_excludes_key_material "$fixture_dir/ghcr-pull.stderr"
+[ "$(docker exec "$docker_backend_container" /bin/sh -c \
+  'grep -Fxc authenticated-ghcr-pull /tmp/imageyard-fake-docker-auth.log')" = 1 ] \
+  || fail "the fake Docker daemon did not receive exactly one helper-authenticated pull"
+
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  'set -eu
+   ready=/tmp/imageyard-ghcr-lock-ready
+   rm -f "$ready"
+   /usr/bin/flock \
+     --exclusive \
+     /run/codex-remote-devbox/ghcr-auth.lock \
+     /bin/sh -c "touch $ready; sleep 2" &
+   holder_pid=$!
+   for attempt in $(seq 1 100); do
+     test -e "$ready" && break
+     sleep 0.02
+   done
+   test -e "$ready"
+   codex-ghcr-auth scrub-legacy-auth &
+   scrub_pid=$!
+   codex-ghcr-auth disable &
+   disable_pid=$!
+   sleep 0.2
+   kill -0 "$scrub_pid"
+   kill -0 "$disable_pid"
+   wait "$holder_pid"
+   wait "$scrub_pid"
+   wait "$disable_pid"
+   rm -f "$ready"' \
+  || fail "concurrent GHCR configuration actions did not serialize through the runtime lock"
+if ! state_volume_run "$home_volume" '
+  set -eu
+  jq -e '\''
+    (.credHelpers | has("ghcr.io") | not) and
+    .credHelpers["registry.example.test"] == "pass" and
+    (.auths | has("ghcr.io") | not) and
+    .auths["registry.example.test"].auth == "dW5yZWxhdGVkOnByZXNlcnZlZA==" and
+    .currentContext == "preserved-context" and
+    .plugins.buildx.enabled == "true"
+  '\'' /state/.docker/config.json >/dev/null
+'; then
+  fail "the managed GHCR helper disable changed unrelated Docker configuration"
+fi
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  'codex-ghcr-auth scrub-legacy-auth && \
+   codex-ghcr-auth scrub-legacy-auth && \
+   codex-ghcr-auth disable && \
+   codex-ghcr-auth disable' \
+  || fail "the explicit GHCR scrub and disable operations are not idempotent"
+ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
+  'codex-ghcr-auth enable && codex-ghcr-auth enable' \
+  || fail "the managed GHCR helper re-enable operation failed"
+assert_home_docker_config_enabled "$home_volume" absent
+home_docker_config_metadata_before_restart="$(record_home_docker_config_metadata "$home_volume")"
+
 direct_ssh_daemon_id="$(
   docker exec "$primary_container" /usr/bin/env -i \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -1948,10 +2326,13 @@ assert_volume_root_metadata "$workspace_volume" 1000:1000:700
 assert_seed_preserved "$home_volume" home 123:456 321:654 home-seed-content
 assert_seed_preserved "$workspace_volume" workspaces 234:567 432:765 workspace-seed-content
 assert_legacy_home_ssh_config_preserved "$home_volume"
+assert_home_docker_config_enabled "$home_volume" absent
+[ "$(record_home_docker_config_metadata "$home_volume")" = "$home_docker_config_metadata_before_restart" ] \
+  || fail "idempotent restart rewrote the managed Home Docker configuration"
 assert_no_probe_leftovers "$home_volume"
 assert_no_probe_leftovers "$workspace_volume"
 assert_volume_top_level_entries \
-  "$home_volume" .codex .imageyard-smoke-state .ssh seed-home
+  "$home_volume" .codex .docker .imageyard-smoke-state .ssh seed-home
 assert_volume_top_level_entries \
   "$workspace_volume" .imageyard-smoke-state seed-workspaces
 
@@ -2021,6 +2402,123 @@ wait_for_runtime_failure \
 
 valid_access_mount="type=bind,src=$fixture_dir/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly"
 valid_host_mount="type=bind,src=$fixture_dir/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly"
+
+for required_name in ghcr_username ghcr_pat; do
+  fixture_label="${required_name//_/-}"
+
+  missing_bundle="$(copy_ghcr_bundle_fixture "missing-$fixture_label")"
+  rm -f -- "$missing_bundle/$required_name"
+  expect_ghcr_bundle_failure \
+    "missing-$fixture_label" \
+    "$missing_bundle" \
+    'required GHCR Secret input is missing'
+
+  empty_bundle="$(copy_ghcr_bundle_fixture "empty-$fixture_label")"
+  chmod u+w "$empty_bundle/$required_name"
+  : > "$empty_bundle/$required_name"
+  if [ "$required_name" = ghcr_pat ]; then
+    chmod 0400 "$empty_bundle/$required_name"
+  else
+    chmod 0444 "$empty_bundle/$required_name"
+  fi
+  expect_ghcr_bundle_failure \
+    "empty-$fixture_label" \
+    "$empty_bundle" \
+    'required GHCR Secret input is empty'
+
+  symlink_bundle="$(copy_ghcr_bundle_fixture "symlink-$fixture_label")"
+  rm -f -- "$symlink_bundle/$required_name"
+  symlink_target=ghcr_pat
+  if [ "$required_name" = ghcr_pat ]; then
+    symlink_target=ghcr_username
+  fi
+  ln -s "$symlink_target" "$symlink_bundle/$required_name"
+  expect_ghcr_bundle_failure \
+    "symlink-$fixture_label" \
+    "$symlink_bundle" \
+    'required GHCR Secret input is a symbolic link'
+
+  directory_bundle="$(copy_ghcr_bundle_fixture "directory-$fixture_label")"
+  rm -f -- "$directory_bundle/$required_name"
+  mkdir "$directory_bundle/$required_name"
+  expect_ghcr_bundle_failure \
+    "directory-$fixture_label" \
+    "$directory_bundle" \
+    'required GHCR Secret input is not a regular file'
+
+  wrong_mode_bundle="$(copy_ghcr_bundle_fixture "wrong-mode-$fixture_label")"
+  if [ "$required_name" = ghcr_pat ]; then
+    chmod 0444 "$wrong_mode_bundle/$required_name"
+  else
+    chmod 0400 "$wrong_mode_bundle/$required_name"
+  fi
+  expect_ghcr_bundle_failure \
+    "wrong-mode-$fixture_label" \
+    "$wrong_mode_bundle" \
+    'source metadata is invalid'
+done
+
+invalid_ghcr_username_bundle="$(copy_ghcr_bundle_fixture invalid-username)"
+write_ghcr_fixture_field "$invalid_ghcr_username_bundle" ghcr_username 'bad user'
+expect_ghcr_bundle_failure \
+  invalid-username \
+  "$invalid_ghcr_username_bundle" \
+  'GHCR username is invalid'
+
+invalid_ghcr_pat_bundle="$(copy_ghcr_bundle_fixture invalid-pat)"
+write_ghcr_fixture_field "$invalid_ghcr_pat_bundle" ghcr_pat 'ghp_invalid PAT value with spaces'
+expect_ghcr_bundle_failure \
+  invalid-pat \
+  "$invalid_ghcr_pat_bundle" \
+  'GHCR PAT is invalid'
+
+high_bit_ghcr_username_bundle="$(copy_ghcr_bundle_fixture high-bit-username)"
+chmod u+w "$high_bit_ghcr_username_bundle/ghcr_username"
+printf '\301' > "$high_bit_ghcr_username_bundle/ghcr_username"
+chmod 0444 "$high_bit_ghcr_username_bundle/ghcr_username"
+expect_ghcr_bundle_failure \
+  high-bit-username \
+  "$high_bit_ghcr_username_bundle" \
+  'GHCR username is invalid'
+
+high_bit_ghcr_pat_bundle="$(copy_ghcr_bundle_fixture high-bit-pat)"
+chmod u+w "$high_bit_ghcr_pat_bundle/ghcr_pat"
+: > "$high_bit_ghcr_pat_bundle/ghcr_pat"
+for high_bit_byte in $(seq 1 20); do
+  printf '\341' >> "$high_bit_ghcr_pat_bundle/ghcr_pat"
+done
+chmod 0400 "$high_bit_ghcr_pat_bundle/ghcr_pat"
+expect_ghcr_bundle_failure \
+  high-bit-pat \
+  "$high_bit_ghcr_pat_bundle" \
+  'GHCR PAT is invalid'
+
+expect_start_failure \
+  "$malformed_docker_config_container" \
+  "$fixture_dir/malformed-docker-config.log" \
+  'GHCR Docker configuration failed' \
+  --network none \
+  --mount "$valid_access_mount" \
+  --mount "$valid_host_mount" \
+  --mount "type=volume,src=$malformed_config_home_volume,dst=/home/codex,volume-nocopy" \
+  --mount "type=volume,src=$malformed_config_workspace_volume,dst=/workspaces,volume-nocopy"
+expect_start_failure \
+  "$symlink_docker_config_container" \
+  "$fixture_dir/symlink-docker-config.log" \
+  'GHCR Docker configuration failed' \
+  --network none \
+  --mount "$valid_access_mount" \
+  --mount "$valid_host_mount" \
+  --mount "type=volume,src=$symlink_config_home_volume,dst=/home/codex,volume-nocopy" \
+  --mount "type=volume,src=$symlink_config_workspace_volume,dst=/workspaces,volume-nocopy"
+for hostile_volume in \
+  "$malformed_config_home_volume" \
+  "$malformed_config_workspace_volume" \
+  "$symlink_config_home_volume" \
+  "$symlink_config_workspace_volume"; do
+  assert_state_excludes_secret_marker "$hostile_volume"
+  assert_no_probe_leftovers "$hostile_volume"
+done
 
 docker_host_required_names=(
   docker_host

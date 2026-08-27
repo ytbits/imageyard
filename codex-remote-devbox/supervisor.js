@@ -9,6 +9,12 @@ const { SOCKET_DIR, SOCKET_PATH, validateRemoteSocketPath } = require('./docker-
 
 const NODE_PATH = '/usr/local/bin/node';
 const BRIDGE_PATH = '/usr/local/libexec/docker-bridge.js';
+const GHCR_CONFIGURATOR_PATH = '/usr/local/bin/codex-ghcr-auth';
+const GHCR_CONFIGURATOR_IMPLEMENTATION_PATH = '/usr/local/libexec/ghcr-auth-config.js';
+const GHCR_HELPER_PATH = '/usr/local/bin/docker-credential-codex-ghcr';
+const GHCR_LOCK_PATH = '/run/codex-remote-devbox/ghcr-auth.lock';
+const GHCR_RUNTIME_DIR = '/run/codex-remote-devbox/ghcr';
+const FLOCK_PATH = '/usr/bin/flock';
 const SETPRIV_PATH = '/usr/bin/setpriv';
 const SSHD_PATH = '/usr/sbin/sshd';
 const SSHD_CONFIG = '/run/codex-remote-devbox/sshd_config';
@@ -169,6 +175,38 @@ function validateRootFile(filePath, executable = false) {
   }
 }
 
+function validateUserFile(filePath, uid = 1000, gid = 1000, mode = 0o600) {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== uid || stat.gid !== gid ||
+      stat.nlink !== 1 || (stat.mode & 0o777) !== mode) {
+    throw new Error('required runtime file is unsafe');
+  }
+}
+
+function validateGhcrRuntime(runtimeDir = GHCR_RUNTIME_DIR, uid = 1000, gid = 1000) {
+  const directory = fs.lstatSync(runtimeDir);
+  if (!directory.isDirectory() || directory.isSymbolicLink() ||
+      directory.uid !== uid || directory.gid !== gid ||
+      (directory.mode & 0o777) !== 0o700) {
+    throw new Error('GHCR runtime directory is invalid');
+  }
+  const expected = ['ghcr_pat', 'ghcr_username'];
+  const actual = fs.readdirSync(runtimeDir).sort();
+  if (actual.length !== expected.length ||
+      actual.some((entry, index) => entry !== expected[index])) {
+    throw new Error('GHCR runtime directory contains an unexpected object');
+  }
+  for (const name of expected) {
+    const credential = fs.lstatSync(path.join(runtimeDir, name));
+    if (!credential.isFile() || credential.isSymbolicLink() ||
+        credential.uid !== uid || credential.gid !== gid ||
+        credential.nlink !== 1 || (credential.mode & 0o777) !== 0o600 ||
+        credential.size === 0) {
+      throw new Error('GHCR runtime credential is invalid');
+    }
+  }
+}
+
 function bridgeLaunch(remoteSocketPath) {
   const validatedPath = validateRemoteSocketPath(remoteSocketPath);
   return {
@@ -198,9 +236,15 @@ async function main() {
   const remoteSocketPath = validateRemoteSocketPath(process.argv[2]);
   validateRootFile(NODE_PATH, true);
   validateRootFile(BRIDGE_PATH);
+  validateRootFile(GHCR_CONFIGURATOR_PATH, true);
+  validateRootFile(GHCR_CONFIGURATOR_IMPLEMENTATION_PATH);
+  validateRootFile(GHCR_HELPER_PATH, true);
+  validateRootFile(FLOCK_PATH, true);
   validateRootFile(SETPRIV_PATH, true);
   validateRootFile(SSHD_PATH, true);
   validateRootFile(SSHD_CONFIG);
+  validateUserFile(GHCR_LOCK_PATH);
+  validateGhcrRuntime();
   prepareRuntimeDirectory();
   await removeStaleSocket();
 
@@ -340,5 +384,7 @@ module.exports = {
   removeStaleSocket,
   socketIsLive,
   validateReadySocket,
+  validateGhcrRuntime,
+  validateUserFile,
   waitWithTimeout,
 };
