@@ -1,10 +1,12 @@
 #!/usr/bin/python3
 """Deterministic dial-stdio fixture for the remote-devbox smoke suite."""
 
+import base64
 import json
 import os
 import re
 import sys
+import urllib.parse
 
 
 EXPECTED_ARGS = [
@@ -12,8 +14,10 @@ EXPECTED_ARGS = [
     "system",
     "dial-stdio",
 ]
-DAEMON_ID = "IMAGEYARD-R4-FAKE-DAEMON-ID"
+DAEMON_ID = "IMAGEYARD-R5-FAKE-DAEMON-ID"
 VERSION_PREFIX = re.compile(br"^/v[0-9]+\.[0-9]+")
+EXPECTED_GHCR_AUTH_PATH = "/run/imageyard-backend/expected-ghcr-auth.json"
+EXPECTED_PULL_IMAGE = "ghcr.io/ytbits/imageyard-private-smoke"
 
 
 def write_bytes(data):
@@ -50,10 +54,17 @@ def read_request(buffer):
     if len(request) != 3:
         raise SystemExit(65)
     content_length = 0
+    headers = {}
     for line in lines[1:]:
         name, separator, value = line.partition(b":")
-        if separator and name.lower() == b"content-length":
-            content_length = int(value.strip())
+        if separator:
+            normalized_name = name.lower()
+            normalized_value = value.strip()
+            if normalized_name in headers:
+                raise SystemExit(65)
+            headers[normalized_name] = normalized_value
+            if normalized_name == b"content-length":
+                content_length = int(normalized_value)
     while len(buffer) < content_length:
         chunk = sys.stdin.buffer.read1(65536)
         if not chunk:
@@ -61,7 +72,25 @@ def read_request(buffer):
         buffer += chunk
     body = buffer[:content_length]
     buffer = buffer[content_length:]
-    return (request[0], request[1], body), buffer
+    return (request[0], request[1], headers, body), buffer
+
+
+def validate_registry_auth(encoded_auth):
+    if not encoded_auth:
+        return False
+    try:
+        padding = b"=" * (-len(encoded_auth) % 4)
+        decoded = base64.urlsafe_b64decode(encoded_auth + padding)
+        actual = json.loads(decoded.decode("utf-8"))
+        with open(EXPECTED_GHCR_AUTH_PATH, encoding="utf-8") as expected_file:
+            expected = json.load(expected_file)
+    except (ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return actual == {
+        "username": expected["username"],
+        "password": expected["secret"],
+        "serveraddress": "ghcr.io",
+    }
 
 
 def main():
@@ -75,18 +104,19 @@ def main():
         request, buffer = read_request(buffer)
         if request is None:
             return
-        method, request_path, body = request
+        method, request_path, headers, body = request
         api_path = VERSION_PREFIX.sub(b"", request_path, count=1)
+        parsed_path = urllib.parse.urlsplit(api_path.decode("ascii"))
 
         if api_path == b"/_ping":
             response(b"200 OK", b"" if method == b"HEAD" else b"OK")
-        elif api_path == b"/version":
+        elif parsed_path.path == "/version":
             payload = json.dumps({
                 "ApiVersion": "1.52",
                 "Arch": "arm64",
                 "BuildTime": "2026-08-24T00:00:00Z",
                 "Experimental": False,
-                "GitCommit": "imageyard-r4-fixture",
+                "GitCommit": "imageyard-r5-fixture",
                 "GoVersion": "go1.25.0",
                 "KernelVersion": "fixture",
                 "MinAPIVersion": "1.24",
@@ -95,7 +125,7 @@ def main():
                 "Version": "29.7.2",
             }, separators=(",", ":")).encode("ascii")
             response(b"200 OK", payload, b"application/json")
-        elif api_path == b"/info":
+        elif parsed_path.path == "/info":
             payload = json.dumps({
                 "ID": DAEMON_ID,
                 "Architecture": "arm64",
@@ -110,13 +140,36 @@ def main():
                 "KernelVersion": "fixture",
                 "MemTotal": 1073741824,
                 "NCPU": 1,
-                "Name": "imageyard-r4-fixture",
+                "Name": "imageyard-r5-fixture",
                 "OperatingSystem": "ImageYard deterministic fixture",
                 "OSType": "linux",
                 "ServerVersion": "29.7.2",
             }, separators=(",", ":")).encode("ascii")
             response(b"200 OK", payload, b"application/json")
-        elif api_path == b"/hijack":
+        elif parsed_path.path == "/images/create" and method == b"POST":
+            query = urllib.parse.parse_qs(parsed_path.query, strict_parsing=True)
+            if query.get("fromImage") != [EXPECTED_PULL_IMAGE] or query.get("tag") != ["fixture"]:
+                response(
+                    b"400 Bad Request",
+                    json.dumps({"message": "unexpected pull target"}).encode("ascii"),
+                    b"application/json",
+                )
+                continue
+            if not validate_registry_auth(headers.get(b"x-registry-auth")):
+                response(
+                    b"401 Unauthorized",
+                    json.dumps({"message": "registry authentication failed"}).encode("ascii"),
+                    b"application/json",
+                )
+                continue
+            with open("/tmp/imageyard-fake-docker-auth.log", "ab", buffering=0) as log:
+                log.write(b"authenticated-ghcr-pull\n")
+            payload = (
+                b'{"status":"Pull complete","id":"imageyard-private-smoke"}\r\n'
+                b'{"status":"Digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\r\n'
+            )
+            response(b"200 OK", payload, b"application/json")
+        elif parsed_path.path == "/hijack":
             write_bytes(
                 b"HTTP/1.1 101 UPGRADED\r\n"
                 b"Connection: Upgrade\r\n"
@@ -130,7 +183,7 @@ def main():
                 if not chunk:
                     return
                 write_bytes(chunk)
-        elif api_path == b"/half-close":
+        elif parsed_path.path == "/half-close":
             write_bytes(
                 b"HTTP/1.1 101 UPGRADED\r\n"
                 b"Connection: Upgrade\r\n"
@@ -145,7 +198,7 @@ def main():
                 payload.extend(chunk)
             write_bytes(b"HALF-CLOSE:" + bytes(payload))
             return
-        elif api_path == b"/large":
+        elif parsed_path.path == "/large":
             write_bytes(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
                 b"Content-Length: 8388608\r\nConnection: close\r\n\r\n"

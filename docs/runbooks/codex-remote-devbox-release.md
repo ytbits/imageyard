@@ -5,7 +5,7 @@ This runbook covers building, validating, publishing, verifying, and rolling bac
 ## Current release contract
 
 - Image: `ghcr.io/ytbits/codex-remote-devbox`
-- Tag: `codex-0.149.0-r4`
+- Tag: `codex-0.149.0-r5`
 - Build context: `codex-remote-devbox/`
 - Dockerfile: `codex-remote-devbox/Dockerfile`
 - Platforms: `linux/amd64`, `linux/arm64`
@@ -15,19 +15,20 @@ This runbook covers building, validating, publishing, verifying, and rolling bac
 
 Tags use `codex-<CODEX_VERSION>-r<REVISION>`. A Codex upgrade starts at `r1`; a packaging-only change for the same Codex version increments the revision. Never reuse or overwrite a published tag, and never publish a moving alias.
 
-`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` added only the pinned Docker clients and a fail-closed remote-Docker SSH bundle. Revision `r4` adds the supervised, Testcontainers-compatible local Unix bridge while preserving Codex `0.149.0`, the exact nine-file bundle, both state mounts, and the inbound SSH interface.
+`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` added only the pinned Docker clients and a fail-closed remote-Docker SSH bundle. Revision `r4` added the supervised, Testcontainers-compatible local Unix bridge. Revision `r5` adds runtime GHCR client authentication while preserving Codex `0.149.0`, the exact nine-file Docker-host bundle, both state mounts, the bridge, and the inbound SSH interface.
 
 The runtime authorized-keys file accepts bare OpenSSH public-key lines only. Do not add per-key options or place a private key, known-hosts file, or another key format at that path.
 
 ## Runtime mount contract
 
-Every start must provide five logical mount sources:
+Every start must provide six logical mount sources:
 
 - a state mount at `/home/codex`;
 - a state mount at `/workspaces`;
 - the authorized-keys file at `/run/secrets/ssh-access/authorized_keys`, read-only;
 - the Ed25519 host private key at `/run/secrets/ssh-host/ssh_host_ed25519_key`, read-only;
-- the Docker-host source directory at `/run/secrets/docker-host`, read-only.
+- the Docker-host source directory at `/run/secrets/docker-host`, read-only;
+- the GHCR credential source directory at `/run/secrets/ghcr`, read-only.
 
 The two state paths must each be real, non-symlink directories and exact mountpoints. Mounting only `/home`, `/`, or another parent does not qualify. After validating identity, mount types, SSH inputs, and OpenSSH configuration, the entrypoint normalizes only each state-mount root to UID/GID `1000` and mode `0700`. It never recursively changes, seeds, wipes, or migrates descendants. It then creates and removes a randomized probe as `codex`; a missing, invalid, read-only, or otherwise unusable mount fails closed before sshd starts.
 
@@ -47,6 +48,29 @@ ssh_known_hosts
 
 Use mode `0400` for `ssh_client_ed25519_private_key` and `0444` for the other inputs. `ssh_alias` must be exactly `docker-host`, and the generated OpenSSH stanza sets `HostKeyAlias docker-host` while retaining `ssh_host` as the real MagicDNS `HostName`. The private key must be Ed25519 and match its stored SHA-256 fingerprint. `ssh_known_hosts` must contain exactly one Ed25519 entry keyed by `docker-host` and match the stored host fingerprint. `docker_host` remains a required `ssh://docker-host/<absolute-socket-path>` consistency input; for example, `ssh://docker-host/Users/codex-smoke/.docker/run/docker.sock`. The image derives only the remote socket path from that URI and never hardcodes the Mac hostname or socket path.
 
+The GHCR directory must expose exactly these two required source paths as root-owned regular, non-symlink, nonempty files:
+
+```text
+/run/secrets/ghcr/ghcr_username  # mode 0444
+/run/secrets/ghcr/ghcr_pat       # mode 0400
+```
+
+The image validates a GitHub-compatible username and a printable single-line token without logging either value. It copies both on every start to `/run/codex-remote-devbox/ghcr/`, which is UID/GID `1000` mode `0700`; the exact runtime files `ghcr_username` and `ghcr_pat` are UID/GID `1000` mode `0600`. Source bytes and metadata remain unchanged. The PAT, helper response, base64 auth, and backups containing them must never enter `/home/codex`, `/workspaces`, image layers, environment variables, arguments, or logs.
+
+Startup runs `codex-ghcr-auth enable` as `codex` before sshd accepts a session. It creates or atomically updates `~/.docker/config.json` to contain only the managed non-secret mapping `credHelpers["ghcr.io"]="codex-ghcr"`, while preserving every unrelated valid JSON field and any existing `auths["ghcr.io"]` under this single-writer startup contract. The `.docker` directory becomes mode `0700` and the config becomes mode `0600`; invalid UTF-8/JSON, symlinks, hardlinks, wrong ownership, invalid `auths`/`credHelpers` sections, a differently managed GHCR helper, and unsafe file types fail closed. Every image-owned public action takes an exclusive kernel `flock` on `/run/codex-remote-devbox/ghcr-auth.lock`, a UID/GID `1000`, single-link, mode-`0600` runtime file. Under that lock, writes use a same-directory single-link mode-`0600` temporary file, file `fsync`, full identity revalidation, atomic rename, and directory `fsync`. A later transaction removes only an exact, safely validated image-named temporary file left by a killed image-owned writer; unsafe or changed stale evidence fails closed rather than being followed, overwritten, or deleted.
+
+This lock is not a general Docker-config transaction lock: `docker login`, `docker logout`, third-party tools, and arbitrary editors do not honor it. A replacement before the final identity check is rejected, but POSIX rename has a residual check-to-rename window in which an uncooperative writer can be overwritten. Before any manual `enable`, `scrub-legacy-auth`, or `disable`, stop or coordinate all sessions and automation that could write `/home/codex/.docker/config.json`; do not run those operations concurrently with Docker login/logout or direct config edits. There is no reliable process-name check for every possible writer, so this is an explicit operator maintenance gate, not an inferred safety check.
+
+Docker gives the per-registry helper precedence over a legacy inline GHCR auth. After a helper-backed private pull or push succeeds, remove only that legacy entry on each Home PVC with the explicit, idempotent command:
+
+```bash
+codex-ghcr-auth scrub-legacy-auth
+```
+
+Do not run this automatically or before acceptance. For rollback preparation, the explicit, idempotent `codex-ghcr-auth disable` removes only an exact image-managed helper mapping. It leaves unrelated configuration and any legacy auth untouched and fails rather than overwrite or remove a different helper value. `codex-ghcr-auth enable` restores the exact managed mapping.
+
+`docker-credential-codex-ghcr` serves the runtime credential only for `ghcr.io` and rejects helper `store`/`erase` operations. It enables every registry operation allowed by the supplied PAT and package ACLs, including push when granted; it is not a pull-only control. A revoked token or GHCR outage fails the registry command without blocking SSH readiness. Because `codex` has full sudo and must be able to pass the credential to Docker, code running as this trusted user can deliberately extract it. This design prevents accidental persistent storage and limits registry matching; it does not prevent malicious exfiltration or provide per-Devbox isolation.
+
 Validated SSH-server inputs are copied to root-owned runtime files. The Docker client private key and known-hosts entry are copied on every start to `/run/codex-remote-devbox/docker-host/` as UID/GID `1000`, mode `0600`. The entrypoint generates the root-owned system `Host docker-host` configuration and a runtime sshd configuration with one `SetEnv` directive that injects exactly these values into authenticated interactive and command sessions:
 
 ```text
@@ -59,9 +83,9 @@ The image does not modify `~/.ssh`, persist shared Docker credentials under `/ho
 
 The image-owned bridge listens only at `/run/codex-remote-devbox/docker-bridge/docker.sock`. Its directory is `1000:1000` mode `0700`, and its Unix socket is `1000:1000` mode `0600`. For each accepted connection it starts one shell-free `/usr/bin/ssh` child with explicit system configuration, disabled TTY/forwarding/multiplexing, alias `docker-host`, and remote command `docker --host=unix://<validated-path> system dial-stdio`. It discards raw SSH stderr and relays concurrent HTTP, hijacked byte streams, and half-closes. A Mac or daemon outage fails that request without killing the bridge or delaying SSH readiness.
 
-Operational boundary: this socket secures transport inside one Devbox; it does not partition the remote daemon. Every Devbox using this shared credential sees and contends for the same Mac daemon's container names and state, networks, images, volumes, build cache, CPU, and memory. Coordinate names and cleanup accordingly. Testcontainers and `docker run -p` publish on the Mac Docker host, not the Kubernetes Pod, and those ports may be reachable from LAN or tailnet peers depending on Docker Desktop, the Mac firewall, and tailnet policy. Revision `r4` adds no Kubernetes Docker TCP Service or listener; do not treat the local Unix socket as an isolation boundary.
+Operational boundary: this socket secures transport inside one Devbox; it does not partition the remote daemon. Every Devbox using this shared credential sees and contends for the same Mac daemon's container names and state, networks, images, volumes, build cache, CPU, and memory. Coordinate names and cleanup accordingly. Testcontainers and `docker run -p` publish on the Mac Docker host, not the Kubernetes Pod, and those ports may be reachable from LAN or tailnet peers depending on Docker Desktop, the Mac firewall, and tailnet policy. Revision `r5` adds no Kubernetes Docker TCP Service or listener; neither the local Unix socket nor separate client credentials hide cached private image layers from another client of the same daemon.
 
-Kubernetes mounts must make all nine source paths regular files at the exact names. A projected Secret's symlink front-end does not meet the non-symlink contract; mount each Secret item read-only at its final path with an explicit `subPath` file mount, with the private key at `0400` and the remaining inputs at `0444`. Together with the two state mounts and two SSH-server key mounts, that is thirteen `volumeMounts`, even though the Docker-host bundle is one logical source. Secret updates require Pod replacement: `subPath` mounts do not receive projected updates, and the entrypoint intentionally copies the validated key and pin only at container start.
+Kubernetes mounts must make all eleven Docker-host and GHCR source paths regular files at the exact names. A projected Secret's symlink front-end does not meet the non-symlink contract; mount each Secret item read-only at its final path with an explicit `subPath` file mount. Use `0400` for the Docker private key and GHCR PAT, and `0444` for the other inputs. Together with the two state mounts and two SSH-server key mounts, that is fifteen `volumeMounts`, even though the Docker-host and GHCR bundles are each one logical source. Secret updates require Pod replacement: `subPath` mounts do not receive projected updates, and the entrypoint intentionally copies validated runtime material only at container start.
 
 GitOps adoption changes only the immutable image reference and rolls the Pod. Do not add deployment-level `DOCKER_HOST`, `DOCKER_CONTEXT`, or Testcontainers environment variables, a host socket mount, sidecar, init container, local daemon, or Kubernetes API dependency. The image generates the three client variables for SSH sessions from the existing bundle.
 
@@ -87,11 +111,16 @@ Run the repository checks from the repository root:
 
 ```bash
 sh -n codex-remote-devbox/entrypoint.sh
+sh -n codex-remote-devbox/ghcr-auth-command.sh
 bash -n codex-remote-devbox/smoke-test.sh
 node --check codex-remote-devbox/docker-bridge.js
 node --check codex-remote-devbox/docker-bridge-client-smoke.js
+node --check codex-remote-devbox/ghcr-auth-config.js
+node --check codex-remote-devbox/ghcr-credential-helper.js
 node --check codex-remote-devbox/supervisor.js
-node --test codex-remote-devbox/docker-bridge.test.js
+node --test \
+  codex-remote-devbox/docker-bridge.test.js \
+  codex-remote-devbox/ghcr-auth.test.js
 python3 -c 'compile(open("codex-remote-devbox/fake-docker-backend.py", encoding="utf-8").read(), "codex-remote-devbox/fake-docker-backend.py", "exec")'
 git diff --check
 ```
@@ -113,6 +142,8 @@ Run the automated smoke test:
 codex-remote-devbox/smoke-test.sh imageyard/codex-remote-devbox:smoke
 ```
 
+On a native Linux host, run the full smoke command through `sudo` so its bind-mounted source fixtures are actually root-owned, matching the runtime contract. Docker Desktop for macOS presents bind-mounted fixture ownership as root inside its Linux VM, so the ordinary command above remains appropriate there. CI runs the Linux smoke as root and still uses only deterministic synthetic credentials.
+
 The smoke test creates disposable named volumes with copy-up disabled, so fresh root-owned volume roots exercise the image bootstrap rather than inheriting the ownership of the baked directories. For an equivalent offline-target manual start, create temporary keys, a complete Docker-host bundle, and two named volumes:
 
 ```bash
@@ -121,7 +152,11 @@ home_volume="codex-devbox-home-$$"
 workspaces_volume="codex-devbox-workspaces-$$"
 container_name="codex-devbox-local-$$"
 
-mkdir -p "$fixture_dir/access" "$fixture_dir/host" "$fixture_dir/docker-host"
+mkdir -p \
+  "$fixture_dir/access" \
+  "$fixture_dir/host" \
+  "$fixture_dir/docker-host" \
+  "$fixture_dir/ghcr"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/client_key"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/host/ssh_host_ed25519_key"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/docker_client_key"
@@ -142,11 +177,16 @@ printf '%s\n' docker-host > "$fixture_dir/docker-host/ssh_alias"
 printf '%s\n' docker.invalid > "$fixture_dir/docker-host/ssh_host"
 printf '%s\n' 22 > "$fixture_dir/docker-host/ssh_port"
 printf '%s\n' codex-smoke > "$fixture_dir/docker-host/ssh_user"
+printf '%s' codex-smoke > "$fixture_dir/ghcr/ghcr_username"
+printf '%s' github_pat_imageyard_smoke_000000000000 \
+  > "$fixture_dir/ghcr/ghcr_pat"
 chmod 0444 "$fixture_dir/access/authorized_keys" "$fixture_dir/docker-host"/*
+chmod 0444 "$fixture_dir/ghcr/ghcr_username"
 chmod 0400 \
   "$fixture_dir/client_key" \
   "$fixture_dir/host/ssh_host_ed25519_key" \
-  "$fixture_dir/docker-host/ssh_client_ed25519_private_key"
+  "$fixture_dir/docker-host/ssh_client_ed25519_private_key" \
+  "$fixture_dir/ghcr/ghcr_pat"
 
 docker volume create "$home_volume"
 docker volume create "$workspaces_volume"
@@ -158,6 +198,7 @@ docker run --detach \
   --mount "type=bind,src=${fixture_dir}/access/authorized_keys,dst=/run/secrets/ssh-access/authorized_keys,readonly" \
   --mount "type=bind,src=${fixture_dir}/host/ssh_host_ed25519_key,dst=/run/secrets/ssh-host/ssh_host_ed25519_key,readonly" \
   --mount "type=bind,src=${fixture_dir}/docker-host,dst=/run/secrets/docker-host,readonly" \
+  --mount "type=bind,src=${fixture_dir}/ghcr,dst=/run/secrets/ghcr,readonly" \
   imageyard/codex-remote-devbox:smoke
 
 for attempt in $(seq 1 60); do
@@ -190,7 +231,7 @@ ssh \
   codex@127.0.0.1
 ```
 
-Both `stat` rows must report `1000:1000 700`. The deliberately unreachable `docker.invalid` target must not delay SSH readiness. Inside the SSH session, `DOCKER_HOST` must be the local bridge URI, `TESTCONTAINERS_HOST_OVERRIDE` must equal the validated `ssh_host`, `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` must be `/var/run/docker.sock`, and `DOCKER_CONTEXT` must be absent. A Docker command is expected to fail promptly until the real Mac becomes reachable, while a later request must be able to recover without restarting the container. Remove the disposable container and volumes after the check; retaining either named volume intentionally retains its state.
+Both `stat` rows must report `1000:1000 700`. The deliberately unreachable `docker.invalid` target must not delay SSH readiness. The GHCR values above are synthetic syntax fixtures, not usable credentials; never put a real PAT in shell history or a checked-in fixture. Inside the SSH session, `DOCKER_HOST` must be the local bridge URI, `TESTCONTAINERS_HOST_OVERRIDE` must equal the validated `ssh_host`, `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` must be `/var/run/docker.sock`, and `DOCKER_CONTEXT` must be absent. `~/.docker/config.json` must contain only the non-secret managed helper mapping plus any pre-existing unrelated state, while the runtime GHCR files remain under `/run` with the documented metadata. A Docker command is expected to fail promptly until the real Mac becomes reachable, while a later request must be able to recover without restarting the container. Remove the disposable container and volumes after the check; retaining either named volume intentionally retains its state.
 
 Before publication, repeat the build and smoke test on a native ARM64 host rather than through emulation:
 
@@ -217,6 +258,10 @@ The smoke test must use temporary Ed25519 client and host keys and must verify a
 - Docker Engine, `dockerd`, `containerd`, DinD, Podman, nerdctl, mounted host/daemon sockets, and Docker daemon listeners are absent; the only local Docker endpoint is the image-owned bridge Unix socket;
 - every missing, empty, symlinked, malformed, wrong-alias, bad-key, bad-fingerprint, or bad-known-host Docker bundle case fails before SSH and before state mutation;
 - the valid offline bundle reaches SSH readiness, preserves all source bytes and metadata, creates only UID/GID `1000` mode `0600` runtime key/pin copies, and leaks no value, fingerprint, key, or raw SSH error into logs, image layers, `/home/codex`, or `/workspaces`;
+- each missing, empty, symlinked, directory-valued, wrong-mode, or malformed GHCR source case fails generically before SSH; a valid root-owned source remains byte/metadata-identical and produces only the exact UID/GID `1000` mode-`0700` runtime directory and two mode-`0600` files;
+- the helper protocol accepts only normalized `ghcr.io` lookups, returns the runtime username/PAT to Docker, rejects `store`, `erase`, unsupported hosts, malformed runtime files, oversized input, and wrong-UID execution, and never prints credential material in an error;
+- a real Docker CLI request through the deterministic remote daemon uses the helper-generated registry auth successfully without `docker login`, environment credentials, or a PAT in Home, while source, runtime, Home, daemon, image/history, and captured logs remain free of unintended credential copies;
+- boot-time enable preserves hostile but Docker-valid unrelated Home configuration and any legacy `auths["ghcr.io"]`; deliberate scrub removes only that exact legacy entry, disable removes only the exact managed mapping, and all three operations are idempotent. A differently managed mapping, invalid UTF-8/JSON, unsafe type, symlink, or hardlink fails without mutation; a replacement injected before the final identity check is detected and preserved. The full smoke also proves that simultaneous image-owned scrub and disable calls block on the private lock and complete serially. It does not claim preservation of an uncooperative external writer in the documented residual check-to-rename window. A real subprocess `SIGKILL` after temporary-file `fsync` leaves one image-named file that the next locked transaction validates, removes, and directory-syncs before updating;
 - the bridge directory is `1000:1000` mode `0700`, the socket is `1000:1000` mode `0600`, both are non-symlink objects with monitored identity, unsafe path occupants fail closed, and verified stale sockets are removed without deleting replacements;
 - both interactive and command SSH sessions receive the exact local `DOCKER_HOST`, validated-host `TESTCONTAINERS_HOST_OVERRIDE`, and `/var/run/docker.sock` override while `DOCKER_CONTEXT` is absent; direct exec remains outside this sshd contract;
 - explicit system SSH configuration defeats an adversarial Home `Host docker-host` stanza, and effective `ssh -G -F /etc/ssh/ssh_config docker-host` contains the validated hostname, `HostKeyAlias docker-host`, `ConnectTimeout 10`, and other fail-closed options;
@@ -226,7 +271,7 @@ The smoke test must use temporary Ed25519 client and host keys and must verify a
 - `codex --version` reports `0.149.0` and `codex app-server --help` succeeds;
 - the lean toolset and pinned Docker clients are present while daemon, Kubernetes, and infrastructure tooling is absent;
 - SSH is the only TCP listener and listens only on `2222`; the bridge is AF_UNIX-only, no login banner is emitted, and no Codex app server is prestarted;
-- the container starts without privileged mode, a mounted host/daemon Docker socket, or mounts beyond the documented Secret and state paths;
+- the container starts without privileged mode, a mounted host/daemon Docker socket, or mounts beyond the documented SSH, Docker-host, GHCR, and state paths;
 - the image and its history contain no test key or token marker;
 - reusing the same externally supplied host key preserves the SSH fingerprint;
 - mounted home and workspace directories preserve state across container replacement;
@@ -268,7 +313,7 @@ If authentication is needed, perform it inside the trusted SSH session with `cod
 The target for this release is:
 
 ```text
-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4
+ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5
 ```
 
 ## Verify publication
@@ -277,7 +322,7 @@ Inspect the remote OCI index:
 
 ```bash
 docker buildx imagetools inspect \
-  ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r4
+  ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5
 ```
 
 Record in the release or pull-request evidence:
@@ -297,8 +342,12 @@ Docker build contexts are sent from the devbox client to the Mac engine. Bind mo
 
 ## Rollback and failed releases
 
-- Roll back a consumer by selecting an older known-good immutable tag or, preferably, its recorded digest.
+- Never roll an `r5` Home PVC directly to `r4` while `credHelpers["ghcr.io"]="codex-ghcr"` remains: `r4` does not contain that helper. Prepare every ordinal independently while it is still running `r5`.
+- Before legacy-auth scrub, quiesce every writer of `~/.docker/config.json`, run `codex-ghcr-auth disable` as `codex` on each ordinal, confirm only the exact helper mapping is absent, and verify that the untouched legacy `auths["ghcr.io"]` still provides the intended access. Then select the known-good `r4` digest. Keep the GHCR source mounted until rollback acceptance is complete; removing it early makes `r5` fail closed on restart.
+- After legacy-auth scrub, there is no inline credential to resume. Keep the `r5` helper and GHCR source available until another credential path has been established and accepted on every ordinal. Either restore an operator-approved client credential without printing it, or remain on `r5`; only then quiesce external config writers, run `codex-ghcr-auth disable`, and roll to `r4`. Do not reconstruct the old inline auth from logs, backups, or shell arguments.
+- If rolling between two `r5`-compatible releases, the exact helper mapping and runtime Secret contract may remain, but still verify the target image contains `docker-credential-codex-ghcr` before replacement.
+- For a general image rollback, select an older known-good immutable tag or, preferably, its recorded digest after completing any version-specific state migration above.
 - Never delete or overwrite the defective tag as part of normal remediation.
-- When Codex remains `0.149.0`, fix a defect in `r4` with a new `codex-0.149.0-r5`; continue incrementing the revision for later packaging fixes.
+- When Codex remains `0.149.0`, fix a defect in `r5` with a new `codex-0.149.0-r6`; continue incrementing the revision for later packaging fixes.
 - If a workflow cannot prove whether the target tag exists, stop. Resolve registry authentication or availability and rerun the complete publish workflow.
 - If publication partially succeeds, inspect the registry before retrying. Any existing target tag requires a new revision.

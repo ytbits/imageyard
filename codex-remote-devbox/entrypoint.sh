@@ -47,6 +47,9 @@ docker_client_key_source="$docker_host_secret_dir/ssh_client_ed25519_private_key
 docker_client_fingerprint_source="$docker_host_secret_dir/ssh_client_ed25519_fingerprint"
 docker_host_fingerprint_source="$docker_host_secret_dir/ssh_host_ed25519_fingerprint"
 docker_known_hosts_source="$docker_host_secret_dir/ssh_known_hosts"
+ghcr_secret_dir=/run/secrets/ghcr
+ghcr_username_source="$ghcr_secret_dir/ghcr_username"
+ghcr_pat_source="$ghcr_secret_dir/ghcr_pat"
 runtime_dir=/run/codex-remote-devbox
 authorized_keys_runtime="$runtime_dir/authorized_keys"
 host_key_runtime="$runtime_dir/ssh_host_ed25519_key"
@@ -55,6 +58,10 @@ authorized_key_validation="$runtime_dir/authorized_key.validation"
 docker_host_runtime_dir="$runtime_dir/docker-host"
 docker_client_key_runtime="$docker_host_runtime_dir/ssh_client_ed25519_private_key"
 docker_known_hosts_runtime="$docker_host_runtime_dir/ssh_known_hosts"
+ghcr_runtime_dir="$runtime_dir/ghcr"
+ghcr_username_runtime="$ghcr_runtime_dir/ghcr_username"
+ghcr_pat_runtime="$ghcr_runtime_dir/ghcr_pat"
+ghcr_auth_lock="$runtime_dir/ghcr-auth.lock"
 docker_ssh_client_config=/etc/ssh/ssh_config.d/20-codex-docker-host.conf
 runtime_sshd_config="$runtime_dir/sshd_config"
 docker_bridge_socket="$runtime_dir/docker-bridge/docker.sock"
@@ -213,6 +220,40 @@ is_safe_docker_host_uri() {
       }
     }
   '
+}
+
+validate_ghcr_username() {
+  LC_ALL=C awk '
+    NR == 1 {
+      value = $0
+      next
+    }
+    { invalid = 1 }
+    END {
+      if (invalid || NR != 1 || length(value) < 1 || length(value) > 39 ||
+          value !~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) {
+        exit 1
+      }
+      printf "%s", value
+    }
+  ' "$1"
+}
+
+validate_ghcr_pat() {
+  LC_ALL=C awk '
+    NR == 1 {
+      value = $0
+      next
+    }
+    { invalid = 1 }
+    END {
+      if (invalid || NR != 1 || length(value) < 20 || length(value) > 512 ||
+          value !~ /^[!-~]+$/) {
+        exit 1
+      }
+      printf "%s", value
+    }
+  ' "$1"
 }
 
 validate_effective_docker_ssh_config() {
@@ -453,6 +494,36 @@ for required_file in \
     || fail "required Docker host Secret input is empty: $required_file"
 done
 
+[ ! -L "$ghcr_secret_dir" ] \
+  || fail "required GHCR Secret directory is a symbolic link"
+[ -e "$ghcr_secret_dir" ] \
+  || fail "required GHCR Secret directory is missing"
+[ -d "$ghcr_secret_dir" ] \
+  || fail "required GHCR Secret path is not a directory"
+
+for required_file in "$ghcr_username_source" "$ghcr_pat_source"; do
+  [ ! -L "$required_file" ] \
+    || fail "required GHCR Secret input is a symbolic link: $required_file"
+  [ -e "$required_file" ] \
+    || fail "required GHCR Secret input is missing: $required_file"
+  [ -f "$required_file" ] \
+    || fail "required GHCR Secret input is not a regular file: $required_file"
+  [ -r "$required_file" ] \
+    || fail "required GHCR Secret input is unreadable: $required_file"
+  [ -s "$required_file" ] \
+    || fail "required GHCR Secret input is empty: $required_file"
+done
+
+[ "$(stat -c '%u:%g:%a' -- "$ghcr_username_source" 2>/dev/null)" = 0:0:444 ] \
+  || fail "GHCR username source metadata is invalid"
+[ "$(stat -c '%u:%g:%a' -- "$ghcr_pat_source" 2>/dev/null)" = 0:0:400 ] \
+  || fail "GHCR PAT source metadata is invalid"
+
+validate_ghcr_username "$ghcr_username_source" >/dev/null \
+  || fail "GHCR username is invalid"
+validate_ghcr_pat "$ghcr_pat_source" >/dev/null \
+  || fail "GHCR PAT is invalid"
+
 docker_host="$(read_secret_scalar "$docker_host_source")" \
   || fail "Docker host URI must be a single nonempty line"
 docker_ssh_alias="$(read_secret_scalar "$docker_ssh_alias_source")" \
@@ -500,6 +571,27 @@ fi
 install -d -o root -g root -m 0755 "$docker_host_runtime_dir"
 [ "$(stat -c '%u:%g:%a' -- "$docker_host_runtime_dir" 2>/dev/null)" = 0:0:755 ] \
   || fail "Docker host runtime directory metadata validation failed"
+[ ! -L "$ghcr_runtime_dir" ] \
+  || fail "GHCR runtime directory is a symbolic link"
+if [ -e "$ghcr_runtime_dir" ]; then
+  [ -d "$ghcr_runtime_dir" ] \
+    || fail "GHCR runtime path is not a directory"
+fi
+install -d -o 1000 -g 1000 -m 0700 "$ghcr_runtime_dir"
+[ "$(stat -c '%u:%g:%a' -- "$ghcr_runtime_dir" 2>/dev/null)" = 1000:1000:700 ] \
+  || fail "GHCR runtime directory metadata validation failed"
+if [ -n "$(find "$ghcr_runtime_dir" -mindepth 1 -maxdepth 1 \
+  ! -name ghcr_username ! -name ghcr_pat -print -quit)" ]; then
+  fail "GHCR runtime directory contains an unexpected object"
+fi
+for runtime_file in "$ghcr_username_runtime" "$ghcr_pat_runtime"; do
+  if [ -e "$runtime_file" ] || [ -L "$runtime_file" ]; then
+    [ ! -L "$runtime_file" ] && [ -f "$runtime_file" ] \
+      || fail "GHCR runtime credential path is unsafe"
+    [ "$(stat -c '%h' -- "$runtime_file" 2>/dev/null)" = 1 ] \
+      || fail "GHCR runtime credential path has unsafe link topology"
+  fi
+done
 install -d -o root -g root -m 0755 /etc/ssh/ssh_config.d
 install -o root -g root -m 0644 "$authorized_keys_source" "$authorized_keys_runtime"
 install -o root -g root -m 0600 "$host_key_source" "$host_key_runtime"
@@ -509,11 +601,37 @@ install -o 1000 -g 1000 -m 0600 "$docker_client_key_source" "$docker_client_key_
   || fail "could not materialize Docker host client key"
 install -o 1000 -g 1000 -m 0600 "$docker_known_hosts_source" "$docker_known_hosts_runtime" \
   || fail "could not materialize Docker host known_hosts"
+install -o 1000 -g 1000 -m 0600 /dev/null "$ghcr_username_runtime" \
+  || fail "could not materialize GHCR username"
+validate_ghcr_username "$ghcr_username_source" > "$ghcr_username_runtime" \
+  || fail "could not materialize GHCR username"
+install -o 1000 -g 1000 -m 0600 /dev/null "$ghcr_pat_runtime" \
+  || fail "could not materialize GHCR PAT"
+validate_ghcr_pat "$ghcr_pat_source" > "$ghcr_pat_runtime" \
+  || fail "could not materialize GHCR PAT"
+chown 1000:1000 -- "$ghcr_username_runtime" "$ghcr_pat_runtime" \
+  || fail "could not set GHCR runtime credential ownership"
+chmod 0600 -- "$ghcr_username_runtime" "$ghcr_pat_runtime" \
+  || fail "could not set GHCR runtime credential mode"
+[ ! -L "$ghcr_auth_lock" ] \
+  || fail "GHCR Docker configuration lock is a symbolic link"
+if [ -e "$ghcr_auth_lock" ]; then
+  [ -f "$ghcr_auth_lock" ] \
+    || fail "GHCR Docker configuration lock is not a regular file"
+fi
+install -o 1000 -g 1000 -m 0600 /dev/null "$ghcr_auth_lock" \
+  || fail "could not materialize GHCR Docker configuration lock"
 
 [ "$(stat -c '%u:%g:%a' -- "$docker_client_key_runtime" 2>/dev/null)" = 1000:1000:600 ] \
   || fail "Docker host client key runtime metadata validation failed"
 [ "$(stat -c '%u:%g:%a' -- "$docker_known_hosts_runtime" 2>/dev/null)" = 1000:1000:600 ] \
   || fail "Docker host known_hosts runtime metadata validation failed"
+[ "$(stat -c '%u:%g:%a:%h' -- "$ghcr_username_runtime" 2>/dev/null)" = 1000:1000:600:1 ] \
+  || fail "GHCR username runtime metadata validation failed"
+[ "$(stat -c '%u:%g:%a:%h' -- "$ghcr_pat_runtime" 2>/dev/null)" = 1000:1000:600:1 ] \
+  || fail "GHCR PAT runtime metadata validation failed"
+[ "$(stat -c '%u:%g:%a:%h' -- "$ghcr_auth_lock" 2>/dev/null)" = 1000:1000:600:1 ] \
+  || fail "GHCR Docker configuration lock metadata validation failed"
 
 if ! awk '
   /^[[:space:]]*($|#)/ { next }
@@ -680,6 +798,29 @@ fi
 for state_root in /home/codex /workspaces; do
   bootstrap_state_root "$state_root"
 done
+
+[ "$(stat -c '%u:%g:%a' -- /usr/local/bin/docker-credential-codex-ghcr 2>/dev/null)" = 0:0:755 ] \
+  || fail "GHCR credential helper metadata validation failed"
+[ "$(stat -c '%u:%g:%a' -- /usr/local/bin/codex-ghcr-auth 2>/dev/null)" = 0:0:755 ] \
+  || fail "GHCR Docker configurator metadata validation failed"
+[ "$(stat -c '%u:%g:%a' -- /usr/local/libexec/ghcr-auth-config.js 2>/dev/null)" = 0:0:644 ] \
+  || fail "GHCR Docker configurator implementation metadata validation failed"
+if ! /usr/bin/setpriv \
+  --reuid=1000 \
+  --regid=1000 \
+  --clear-groups \
+  --no-new-privs \
+  -- \
+  /usr/bin/env -i \
+    HOME=/home/codex \
+    LANG=C.UTF-8 \
+    LOGNAME=codex \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    SHELL=/bin/bash \
+    USER=codex \
+    /usr/local/bin/codex-ghcr-auth enable; then
+  fail "GHCR Docker configuration failed"
+fi
 
 if ! sudo -n -H -u codex -- /usr/bin/ssh -G -F /etc/ssh/ssh_config "$docker_ssh_alias" 2>/dev/null \
   | validate_effective_docker_ssh_config \

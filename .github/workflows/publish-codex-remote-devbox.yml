@@ -9,6 +9,9 @@ on:
       - "codex-remote-devbox/Dockerfile"
       - "codex-remote-devbox/docker-bridge.js"
       - "codex-remote-devbox/entrypoint.sh"
+      - "codex-remote-devbox/ghcr-auth-command.sh"
+      - "codex-remote-devbox/ghcr-auth-config.js"
+      - "codex-remote-devbox/ghcr-credential-helper.js"
       - "codex-remote-devbox/sshd_config"
       - "codex-remote-devbox/supervisor.js"
   workflow_dispatch:
@@ -22,7 +25,7 @@ concurrency:
 
 env:
   IMAGE_NAME: codex-remote-devbox
-  IMAGE_TAG: codex-0.149.0-r4
+  IMAGE_TAG: codex-0.149.0-r5
   CODEX_VERSION: 0.149.0
   BASE_IMAGE_NAME: docker.io/library/node:24.19.0-bookworm-slim
   BASE_IMAGE_DIGEST: sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03

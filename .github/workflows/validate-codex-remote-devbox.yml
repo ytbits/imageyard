@@ -21,7 +21,7 @@ permissions:
 
 env:
   EXPECTED_CODEX_VERSION: 0.149.0
-  EXPECTED_IMAGE_TAG: codex-0.149.0-r4
+  EXPECTED_IMAGE_TAG: codex-0.149.0-r5
   EXPECTED_NODE_VERSION: 24.19.0
   EXPECTED_DOCKER_CLI_PACKAGE_VERSION: 5:29.7.2-1~debian.12~bookworm
   EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION: 0.36.1-1~debian.12~bookworm
@@ -50,8 +50,13 @@ jobs:
           bash -n codex-remote-devbox/smoke-test.sh
           node --check codex-remote-devbox/docker-bridge.js
           node --check codex-remote-devbox/docker-bridge-client-smoke.js
+          sh -n codex-remote-devbox/ghcr-auth-command.sh
+          node --check codex-remote-devbox/ghcr-auth-config.js
+          node --check codex-remote-devbox/ghcr-credential-helper.js
           node --check codex-remote-devbox/supervisor.js
-          node --test codex-remote-devbox/docker-bridge.test.js
+          node --test \
+            codex-remote-devbox/docker-bridge.test.js \
+            codex-remote-devbox/ghcr-auth.test.js
           python3 -c 'compile(open("codex-remote-devbox/fake-docker-backend.py", encoding="utf-8").read(), "codex-remote-devbox/fake-docker-backend.py", "exec")'
           git diff --check HEAD^ HEAD
 
@@ -283,4 +288,6 @@ jobs:
         env:
           DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
           IMAGE: imageyard/codex-remote-devbox:validation-${{ matrix.arch }}
-        run: codex-remote-devbox/smoke-test.sh "$IMAGE"
+        run: |
+          sudo --preserve-env=DOCKER_DEFAULT_PLATFORM \
+            codex-remote-devbox/smoke-test.sh "$IMAGE"
