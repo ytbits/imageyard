@@ -5,17 +5,17 @@ This runbook covers building, validating, publishing, verifying, and rolling bac
 ## Current release contract
 
 - Image: `ghcr.io/ytbits/codex-remote-devbox`
-- Tag: `codex-0.149.0-r5`
+- Tag: `codex-0.157.1-r1`
 - Build context: `codex-remote-devbox/`
 - Dockerfile: `codex-remote-devbox/Dockerfile`
 - Platforms: `linux/amd64`, `linux/arm64`
 - Base: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
-- Codex package: `@openai/codex@0.149.0`
+- Codex package: `@openai/codex@0.157.1`
 - Docker packages: `docker-ce-cli=5:29.7.2-1~debian.12~bookworm`, `docker-buildx-plugin=0.36.1-1~debian.12~bookworm`, and `docker-compose-plugin=5.5.0-1~debian.12~bookworm`
 
 Tags use `codex-<CODEX_VERSION>-r<REVISION>`. A Codex upgrade starts at `r1`; a packaging-only change for the same Codex version increments the revision. Never reuse or overwrite a published tag, and never publish a moving alias.
 
-`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` added only the pinned Docker clients and a fail-closed remote-Docker SSH bundle. Revision `r4` added the supervised, Testcontainers-compatible local Unix bridge. Revision `r5` adds runtime GHCR client authentication while preserving Codex `0.149.0`, the exact nine-file Docker-host bundle, both state mounts, the bridge, and the inbound SSH interface.
+`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` added only the pinned Docker clients and a fail-closed remote-Docker SSH bundle. Revision `r4` added the supervised, Testcontainers-compatible local Unix bridge. Revision `r5` added runtime GHCR client authentication while preserving Codex `0.149.0`, the exact nine-file Docker-host bundle, both state mounts, the bridge, and the inbound SSH interface. The current `codex-0.157.1-r1` upgrades only Codex and its protocol smoke coverage; it preserves all `0.149.0-r5` runtime contracts and the existing Node base and Docker package pins. Its larger upstream native payload increases image size, so allow additional disk, cache, and transfer capacity during builds and pulls.
 
 The runtime authorized-keys file accepts bare OpenSSH public-key lines only. Do not add per-key options or place a private key, known-hosts file, or another key format at that path.
 
@@ -115,6 +115,7 @@ sh -n codex-remote-devbox/ghcr-auth-command.sh
 bash -n codex-remote-devbox/smoke-test.sh
 node --check codex-remote-devbox/docker-bridge.js
 node --check codex-remote-devbox/docker-bridge-client-smoke.js
+node --check codex-remote-devbox/app-server-smoke.js
 node --check codex-remote-devbox/ghcr-auth-config.js
 node --check codex-remote-devbox/ghcr-credential-helper.js
 node --check codex-remote-devbox/supervisor.js
@@ -125,7 +126,7 @@ python3 -c 'compile(open("codex-remote-devbox/fake-docker-backend.py", encoding=
 git diff --check
 ```
 
-The focused Node suite covers fixed argument construction, path rejection, Unix-socket metadata, concurrent binary and hijacked relays, offline request recovery, bounded child reaping, socket-identity failure, and safe stale-socket cleanup without using Docker or the real Mac. The full image smoke additionally runs a deterministic fake SSH server and `docker system dial-stdio` backend on each target architecture.
+The focused Node suite covers fixed argument construction, path rejection, Unix-socket metadata, concurrent binary and hijacked relays, offline request recovery, bounded child reaping, socket-identity failure, and safe stale-socket cleanup without using Docker or the real Mac. The full image smoke additionally runs a deterministic fake SSH server and `docker system dial-stdio` backend on each target architecture. It also invokes `app-server-smoke.js` through authenticated SSH to initialize a stdio app server, acknowledge initialization, read configuration without printing values, and verify clean shutdown within a bounded timeout. This protocol check needs no Codex login or model request and complements the Codex Desktop acceptance check below.
 
 Build the local smoke-test image:
 
@@ -268,7 +269,8 @@ The smoke test must use temporary Ed25519 client and host keys and must verify a
 - a deterministic fake SSH/dial-stdio backend proves concurrent `/_ping`, Docker CLI and Node clients observing the same daemon identity, one fixed `/usr/bin/ssh` argv per connection, binary hijack and half-close relay, stderr isolation, prompt offline failure, and later-request recovery without the user's Mac;
 - the SSH session is UID/GID `1000` and Bash is the login shell;
 - `sudo -n id -u` returns `0`;
-- `codex --version` reports `0.149.0` and `codex app-server --help` succeeds;
+- `codex --version` reports `0.157.1` and `codex app-server --help` succeeds;
+- on fresh and reused Home fixtures, a bounded authenticated SSH stdio session sends `initialize`, verifies the exact version, `codexHome=/home/codex/.codex`, `platformFamily=unix`, and `platformOs=linux`, then sends `initialized` followed by `config/read` and requires a successful response without logging configuration values; closing input exits cleanly and leaves no child process or new TCP listener;
 - the lean toolset and pinned Docker clients are present while daemon, Kubernetes, and infrastructure tooling is absent;
 - SSH is the only TCP listener and listens only on `2222`; the bridge is AF_UNIX-only, no login banner is emitted, and no Codex app server is prestarted;
 - the container starts without privileged mode, a mounted host/daemon Docker socket, or mounts beyond the documented SSH, Docker-host, GHCR, and state paths;
@@ -313,7 +315,7 @@ If authentication is needed, perform it inside the trusted SSH session with `cod
 The target for this release is:
 
 ```text
-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5
+ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1
 ```
 
 ## Verify publication
@@ -322,7 +324,7 @@ Inspect the remote OCI index:
 
 ```bash
 docker buildx imagetools inspect \
-  ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5
+  ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1
 ```
 
 Record in the release or pull-request evidence:
@@ -342,12 +344,13 @@ Docker build contexts are sent from the devbox client to the Mac engine. Bind mo
 
 ## Rollback and failed releases
 
+- `codex-0.157.1-r1` retains the GHCR helper and runtime inputs from `codex-0.149.0-r5`. A rollback to that prior image does not require removing the managed helper mapping; use the recorded known-good digest and verify Codex login and project state after reconnecting. Rollbacks to releases older than `0.149.0-r5` still require the GHCR staging below.
 - Never roll an `r5` Home PVC directly to `r4` while `credHelpers["ghcr.io"]="codex-ghcr"` remains: `r4` does not contain that helper. Prepare every ordinal independently while it is still running `r5`.
 - Before legacy-auth scrub, quiesce every writer of `~/.docker/config.json`, run `codex-ghcr-auth disable` as `codex` on each ordinal, confirm only the exact helper mapping is absent, and verify that the untouched legacy `auths["ghcr.io"]` still provides the intended access. Then select the known-good `r4` digest. Keep the GHCR source mounted until rollback acceptance is complete; removing it early makes `r5` fail closed on restart.
 - After legacy-auth scrub, there is no inline credential to resume. Keep the `r5` helper and GHCR source available until another credential path has been established and accepted on every ordinal. Either restore an operator-approved client credential without printing it, or remain on `r5`; only then quiesce external config writers, run `codex-ghcr-auth disable`, and roll to `r4`. Do not reconstruct the old inline auth from logs, backups, or shell arguments.
 - If rolling between two `r5`-compatible releases, the exact helper mapping and runtime Secret contract may remain, but still verify the target image contains `docker-credential-codex-ghcr` before replacement.
 - For a general image rollback, select an older known-good immutable tag or, preferably, its recorded digest after completing any version-specific state migration above.
 - Never delete or overwrite the defective tag as part of normal remediation.
-- When Codex remains `0.149.0`, fix a defect in `r5` with a new `codex-0.149.0-r6`; continue incrementing the revision for later packaging fixes.
+- When Codex remains `0.157.1`, fix a defect in `r1` with a new `codex-0.157.1-r2`; continue incrementing the revision for later packaging fixes.
 - If a workflow cannot prove whether the target tag exists, stop. Resolve registry authentication or availability and rerun the complete publish workflow.
 - If publication partially succeeds, inspect the registry before retrying. Any existing target tag requires a new revision.

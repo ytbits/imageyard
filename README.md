@@ -25,6 +25,7 @@ imageyard/
 ├── codex-remote-devbox/
 │   ├── .dockerignore
 │   ├── Dockerfile
+│   ├── app-server-smoke.js
 │   ├── docker-bridge-client-smoke.js
 │   ├── docker-bridge.js
 │   ├── docker-bridge.test.js
@@ -54,10 +55,10 @@ imageyard/
 
 The `codex-remote-devbox/` directory defines an SSH-accessible development environment for Codex Desktop remote connections:
 
-- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5`
+- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1`
 - Dockerfile and build context: `codex-remote-devbox/Dockerfile` and `codex-remote-devbox/`
 - Base: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
-- Codex CLI: `@openai/codex@0.149.0`
+- Codex CLI: `@openai/codex@0.157.1`
 - Published platforms: `linux/amd64`, `linux/arm64`
 - SSH contract: port `2222`, user `codex` with UID/GID `1000` and Bash
 - Required state mountpoints: `/home/codex` and `/workspaces`
@@ -65,6 +66,8 @@ The `codex-remote-devbox/` directory defines an SSH-accessible development envir
 - Runtime host key: `/run/secrets/ssh-host/ssh_host_ed25519_key`
 - Runtime Docker-host bundle: `/run/secrets/docker-host/`
 - Runtime GHCR bundle: `/run/secrets/ghcr/ghcr_username` and `/run/secrets/ghcr/ghcr_pat`
+
+The current release upgrades Codex CLI from `0.149.0` to stable `0.157.1` and resets the packaging revision to `r1`. It preserves the runtime contracts introduced through `codex-0.149.0-r5`, including the GHCR helper, Docker bridge, SSH interface, and state mounts. The pinned Node base and Docker client packages are unchanged. The larger upstream native Codex payload increases image storage and transfer requirements.
 
 Both state paths must be explicit mountpoints; image-layer directories or a mount on only a parent path do not satisfy the contract. After validating the fixed identity, mount types, runtime keys, and OpenSSH configuration, the root entrypoint bootstraps only the two mount roots to UID/GID `1000` and mode `0700`, then verifies that `codex` can create and remove a temporary probe. Bootstrap is nonrecursive: it never seeds, wipes, changes, or migrates existing descendants. A missing, non-directory, symlinked, non-mountpoint, read-only, or otherwise unusable state root fails closed before SSH starts.
 
@@ -84,7 +87,7 @@ The image also includes a lean Node, Python, Git, GitHub CLI, SSH, and build too
 
 The bridge is a transport boundary, not a Docker-tenancy boundary. Devboxes that share this credential target the same Mac daemon and therefore share daemon-wide container names and state, networks, images, volumes, build cache, and CPU/memory contention. Testcontainers and `-p` published ports bind on the Mac Docker host and may be reachable by LAN or tailnet peers according to Docker Desktop, host-firewall, and tailnet policy. Revision `r5` adds no Kubernetes-side Docker TCP exposure; the private local Unix socket and per-client GHCR credential do not isolate one Devbox's Docker activity or already-cached private layers from another.
 
-Codex Desktop starts its app server through the SSH connection, so the image does not start or expose an app-server listener. See the official [remote connections](https://learn.chatgpt.com/docs/remote-connections) and [authentication](https://learn.chatgpt.com/docs/auth) documentation.
+Codex Desktop starts its app server through the SSH connection, so the image does not start or expose an app-server listener. Both architecture smoke suites exercise that path with a bounded authenticated SSH stdio session: send `initialize`, verify the reported Codex version, `codexHome=/home/codex/.codex`, and Linux platform, then send `initialized` and require a successful `config/read` response and clean shutdown. The check runs against fresh and reused Home fixtures and verifies that the app server adds no TCP listener. See the official [remote connections](https://learn.chatgpt.com/docs/remote-connections) and [authentication](https://learn.chatgpt.com/docs/auth) documentation.
 
 Codex remote devbox tags have the immutable form `codex-<CODEX_VERSION>-r<REVISION>`. A Codex upgrade resets the revision to `r1`; packaging-only changes increment it. The project never publishes `latest`, `stable`, or another moving alias.
 

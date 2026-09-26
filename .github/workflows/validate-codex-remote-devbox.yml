@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 env:
-  EXPECTED_CODEX_VERSION: 0.149.0
-  EXPECTED_IMAGE_TAG: codex-0.149.0-r5
+  EXPECTED_CODEX_VERSION: 0.157.1
+  EXPECTED_IMAGE_TAG: codex-0.157.1-r1
   EXPECTED_NODE_VERSION: 24.19.0
   EXPECTED_DOCKER_CLI_PACKAGE_VERSION: 5:29.7.2-1~debian.12~bookworm
   EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION: 0.36.1-1~debian.12~bookworm
@@ -48,6 +48,7 @@ jobs:
           set -euo pipefail
           sh -n codex-remote-devbox/entrypoint.sh
           bash -n codex-remote-devbox/smoke-test.sh
+          node --check codex-remote-devbox/app-server-smoke.js
           node --check codex-remote-devbox/docker-bridge.js
           node --check codex-remote-devbox/docker-bridge-client-smoke.js
           sh -n codex-remote-devbox/ghcr-auth-command.sh

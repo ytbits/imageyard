@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-26 - Upgrade Codex Remote Devbox to 0.157.1
+
+- Upgraded the Codex remote devbox from CLI `0.149.0` to stable `0.157.1` and reset the immutable image revision to `ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1`.
+- Preserved the `0.149.0-r5` GHCR credential helper and Secret contract, exact nine-file Docker-host bundle, supervised Docker bridge, state mounts, inbound SSH interface, pinned Node base, and pinned Docker client packages.
+- Added a bounded authenticated SSH app-server stdio smoke exchange using `initialize`, `initialized`, and `config/read`, checking the exact version, `codexHome=/home/codex/.codex`, Unix/Linux platform, clean shutdown, and the absence of an additional TCP listener on fresh and reused Home fixtures without logging configuration values.
+- Retained native amd64/arm64 validation and Codex Desktop acceptance before publication, and documented the larger upstream native payload's image storage and transfer cost.
+
 ## 2026-08-26 - Add Runtime GHCR Docker Client Authentication
 
 - Bumped the Codex remote devbox packaging revision to immutable `ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5` while preserving Codex CLI `0.149.0`, the remote-Docker bridge, the exact nine-file Docker-host contract, both state mounts, and the inbound SSH interface.
