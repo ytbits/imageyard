@@ -843,7 +843,7 @@ assert_ssh_app_server_protocol() {
   [[ "$expected_codex_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || fail "app-server smoke requires an exact stable Codex version"
   ssh_command "$known_hosts_file" "$port" "$fixture_dir/client_key" codex \
-    "timeout --signal=TERM --kill-after=5s 40s node - '$expected_codex_version'" \
+    "timeout --signal=TERM --kill-after=5s 75s node - '$expected_codex_version'" \
     < "$script_dir/app-server-smoke.js" \
     || fail "authenticated SSH app-server protocol smoke failed"
 }

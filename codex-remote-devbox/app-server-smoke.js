@@ -157,35 +157,39 @@ async function main() {
     child.once('error', () => fail(new Error('app-server spawn failed')));
     child.once('close', (code, signal) => resolve({ code, signal }));
   });
-  send({ id: 1, method: 'initialize', params: {
-    clientInfo: { name: 'imageyard_smoke', version: '1.0.0' },
-  } });
-  const result = await exited;
-  clearTimeout(deadline);
-  clearTimeout(killTimer);
-  clearTimeout(exitTimer);
-  process.removeListener('SIGTERM', onSignal);
-  process.removeListener('SIGINT', onSignal);
-  // Startup may finish a short-lived Git fetch after the protocol process exits.
-  // Require natural completion within a finite grace period; only failed checks
-  // terminate the remaining group, and they still fail the release smoke.
-  if (!(await waitForGroupExit(child, 5000))) {
-    signalGroup(child, 'SIGTERM');
-    if (!(await waitForGroupExit(child, 2000))) {
-      signalGroup(child, 'SIGKILL');
-      await waitForGroupExit(child, 1000);
+  try {
+    send({ id: 1, method: 'initialize', params: {
+      clientInfo: { name: 'imageyard_smoke', version: '1.0.0' },
+    } });
+    const result = await exited;
+    clearTimeout(deadline);
+    // Startup may finish a short-lived Git fetch after the protocol process exits.
+    // Require natural completion within a finite grace period; only failed checks
+    // terminate the remaining group, and they still fail the release smoke.
+    if (!(await waitForGroupExit(child, 5000))) {
+      signalGroup(child, 'SIGTERM');
+      if (!(await waitForGroupExit(child, 2000))) {
+        signalGroup(child, 'SIGKILL');
+        await waitForGroupExit(child, 1000);
+      }
+      throw new Error('app-server left a process behind');
     }
-    throw new Error('app-server left a process behind');
+    if (failure) throw failure;
+    requireCondition(phase === 'shutdown' && result.code === 0 && result.signal === null,
+      'app-server did not shut down cleanly after protocol completion');
+    requireCondition(buffered.trim() === '', 'incomplete app-server protocol message');
+    requireCondition(!fs.existsSync('/home/codex/.codex/auth.json'),
+      'app-server smoke unexpectedly created authentication state');
+    assertNoCodexProcess();
+    assertTcpListeners();
+    process.stdout.write(`app-server-smoke: ok ${expectedVersion} /home/codex/.codex linux\n`);
+  } finally {
+    clearTimeout(deadline);
+    clearTimeout(killTimer);
+    clearTimeout(exitTimer);
+    process.removeListener('SIGTERM', onSignal);
+    process.removeListener('SIGINT', onSignal);
   }
-  if (failure) throw failure;
-  requireCondition(phase === 'shutdown' && result.code === 0 && result.signal === null,
-    'app-server did not shut down cleanly after protocol completion');
-  requireCondition(buffered.trim() === '', 'incomplete app-server protocol message');
-  requireCondition(!fs.existsSync('/home/codex/.codex/auth.json'),
-    'app-server smoke unexpectedly created authentication state');
-  assertNoCodexProcess();
-  assertTcpListeners();
-  process.stdout.write(`app-server-smoke: ok ${expectedVersion} /home/codex/.codex linux\n`);
 }
 
 main().catch((error) => {
