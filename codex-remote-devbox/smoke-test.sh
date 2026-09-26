@@ -2,8 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.149.0-r5}"
-expected_codex_version="${EXPECTED_CODEX_VERSION:-0.149.0}"
+image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1}"
+expected_codex_version="${EXPECTED_CODEX_VERSION:-0.157.1}"
 expected_docker_ce_cli_version="${EXPECTED_DOCKER_CLI_PACKAGE_VERSION:-5:29.7.2-1~debian.12~bookworm}"
 expected_docker_buildx_version="${EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION:-0.36.1-1~debian.12~bookworm}"
 expected_docker_compose_version="${EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION:-5.5.0-1~debian.12~bookworm}"
@@ -213,6 +213,7 @@ legacy_ghcr_auth_encoded="$(
 docker image inspect "$image" >/dev/null 2>&1 \
   || fail "image is not available locally: $image"
 for fixture_file in \
+  "$script_dir/app-server-smoke.js" \
   "$script_dir/docker-bridge-client-smoke.js" \
   "$script_dir/fake-docker-backend.py" \
   "$script_dir/fake-docker-sshd_config"; do
@@ -831,6 +832,20 @@ ssh_command() {
     -o "UserKnownHostsFile=$known_hosts_file" \
     "${user}@127.0.0.1" \
     "$@"
+}
+
+assert_ssh_app_server_protocol() {
+  local known_hosts_file="$1"
+  local port="$2"
+
+  # The fixture travels over the authenticated connection; direct exec would
+  # bypass sshd's login environment. A second outer deadline bounds the client.
+  [[ "$expected_codex_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || fail "app-server smoke requires an exact stable Codex version"
+  ssh_command "$known_hosts_file" "$port" "$fixture_dir/client_key" codex \
+    "timeout --signal=TERM --kill-after=5s 75s node - '$expected_codex_version'" \
+    < "$script_dir/app-server-smoke.js" \
+    || fail "authenticated SSH app-server protocol smoke failed"
 }
 
 expected_ssh_docker_environment() {
@@ -2046,6 +2061,9 @@ ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" cod
   || fail "Codex version does not match $expected_codex_version"
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex \
   'codex app-server --help >/dev/null'
+assert_ssh_app_server_protocol "$primary_known_hosts" "$primary_port"
+# Reconnect to the same Home after a clean app-server exit.
+assert_ssh_app_server_protocol "$primary_known_hosts" "$primary_port"
 
 ssh_command "$primary_known_hosts" "$primary_port" "$fixture_dir/client_key" codex '
   set -eu
@@ -2347,6 +2365,7 @@ assert_ssh_docker_environment \
   "$restart_port" \
   "$docker_host_hostname" \
   "replacement command SSH session"
+assert_ssh_app_server_protocol "$restart_known_hosts" "$restart_port"
 restart_daemon_id="$(
   ssh_command "$restart_known_hosts" "$restart_port" "$fixture_dir/client_key" codex \
     "docker info --format '{{.ID}}'"
