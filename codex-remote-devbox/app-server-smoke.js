@@ -4,6 +4,7 @@
 // Test-only client, streamed into an authenticated SSH session by smoke-test.sh.
 const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
+const { setTimeout: delay } = require('node:timers/promises');
 
 function requireCondition(condition, message) {
   if (!condition) throw new Error(message);
@@ -43,6 +44,15 @@ function groupExists(child) {
     if (error.code === 'ESRCH') return false;
     throw error;
   }
+}
+
+async function waitForGroupExit(child, milliseconds) {
+  const deadline = Date.now() + milliseconds;
+  while (groupExists(child)) {
+    if (Date.now() >= deadline) return false;
+    await delay(25);
+  }
+  return true;
 }
 
 function assertNoCodexProcess() {
@@ -156,8 +166,15 @@ async function main() {
   clearTimeout(exitTimer);
   process.removeListener('SIGTERM', onSignal);
   process.removeListener('SIGINT', onSignal);
-  if (groupExists(child)) {
-    signalGroup(child, 'SIGKILL');
+  // Startup may finish a short-lived Git fetch after the protocol process exits.
+  // Require natural completion within a finite grace period; only failed checks
+  // terminate the remaining group, and they still fail the release smoke.
+  if (!(await waitForGroupExit(child, 5000))) {
+    signalGroup(child, 'SIGTERM');
+    if (!(await waitForGroupExit(child, 2000))) {
+      signalGroup(child, 'SIGKILL');
+      await waitForGroupExit(child, 1000);
+    }
     throw new Error('app-server left a process behind');
   }
   if (failure) throw failure;
