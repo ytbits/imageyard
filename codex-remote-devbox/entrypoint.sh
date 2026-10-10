@@ -843,7 +843,4 @@ exec /usr/bin/env -i \
   USER=root \
   CODEX_APP_SERVER_ENABLED="${CODEX_APP_SERVER_ENABLED:-0}" \
   CODEX_APP_SERVER_ORDINAL="${CODEX_APP_SERVER_ORDINAL:-}" \
-  CODEX_APP_SERVER_TOKEN_FILE="${CODEX_APP_SERVER_TOKEN_FILE:-/run/secrets/app-server/token}" \
-  CODEX_APP_SERVER_TLS_CERT_FILE="${CODEX_APP_SERVER_TLS_CERT_FILE:-/run/secrets/app-server/tls.crt}" \
-  CODEX_APP_SERVER_TLS_KEY_FILE="${CODEX_APP_SERVER_TLS_KEY_FILE:-/run/secrets/app-server/tls.key}" \
   /usr/local/bin/node /usr/local/libexec/supervisor.js "$docker_socket_path"

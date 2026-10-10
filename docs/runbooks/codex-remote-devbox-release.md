@@ -5,7 +5,7 @@ This runbook covers building, validating, publishing, verifying, and rolling bac
 ## Current release contract
 
 - Image: `ghcr.io/ytbits/codex-remote-devbox`
-- Tag: `codex-0.162.1-r1`
+- Tag: `codex-0.162.1-r2`
 - Build context: `codex-remote-devbox/`
 - Dockerfile: `codex-remote-devbox/Dockerfile`
 - Platforms: `linux/amd64`, `linux/arm64`
@@ -15,7 +15,7 @@ This runbook covers building, validating, publishing, verifying, and rolling bac
 
 Tags use `codex-<CODEX_VERSION>-r<REVISION>`. A Codex upgrade starts at `r1`; a packaging-only change for the same Codex version increments the revision. Never reuse or overwrite a published tag, and never publish a moving alias.
 
-`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` added only the pinned Docker clients and a fail-closed remote-Docker SSH bundle. Revision `r4` added the supervised, Testcontainers-compatible local Unix bridge. Revision `r5` added runtime GHCR client authentication while preserving Codex `0.149.0`, the exact nine-file Docker-host bundle, both state mounts, the bridge, and the inbound SSH interface. The proposed `codex-0.162.1-r1` upgrades Codex from `0.157.1` and adds the explicit opt-in App Server gateway described in [the access runbook](codex-app-server-access.md). It preserves default SSH/state/Docker/GHCR behavior and existing Node and Docker package pins. Its larger upstream native payload increases image size, so allow additional disk, cache, and transfer capacity during builds and pulls.
+`codex-0.149.0-r1` remains the historical initial release. Revision `r2` added the mandatory state-mount bootstrap contract. Revision `r3` added only the pinned Docker clients and a fail-closed remote-Docker SSH bundle. Revision `r4` added the supervised, Testcontainers-compatible local Unix bridge. Revision `r5` added runtime GHCR client authentication while preserving Codex `0.149.0`, the exact nine-file Docker-host bundle, both state mounts, the bridge, and the inbound SSH interface. The proposed `codex-0.162.1-r2` retains Codex `0.162.1` and simplifies the opt-in App Server relay to plain WebSocket without TLS or a token, described in [the access runbook](codex-app-server-access.md). It preserves default SSH/state/Docker/GHCR behavior and existing Node and Docker package pins. Its larger upstream native payload increases image size, so allow additional disk, cache, and transfer capacity during builds and pulls.
 
 The runtime authorized-keys file accepts bare OpenSSH public-key lines only. Do not add per-key options or place a private key, known-hosts file, or another key format at that path.
 
@@ -326,7 +326,7 @@ If authentication is needed, perform it inside the trusted SSH session with `cod
 The target for this release is:
 
 ```text
-ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r1
+ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r2
 ```
 
 ## Verify publication
@@ -335,7 +335,7 @@ Inspect the remote OCI index:
 
 ```bash
 docker buildx imagetools inspect \
-  ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r1
+  ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r2
 ```
 
 Record in the release or pull-request evidence:
@@ -355,15 +355,15 @@ Docker build contexts are sent from the devbox client to the Mac engine. Bind mo
 
 ## Rollback and failed releases
 
-Before rolling an enabled gateway back to the older image, quiesce callers and remove its network route/enablement in the deployment change. Keep Home and Workspace volumes. The older image has no gateway; reconnect Desktop over SSH and validate saved sessions separately. Do not assume older Codex can read every state schema written by a newer version.
+Before rolling an enabled relay back to an older image, quiesce callers and disable its network enablement in the deployment change. Keep Home and Workspace volumes. Version `0.162.1-r1` used TLS/token inputs and port `8443`; images before `0.162.1` have no relay. Reconnect Desktop over SSH and validate saved sessions separately. Do not assume older Codex can read every state schema written by a newer version.
 
-- `codex-0.162.1-r1` retains the GHCR helper and runtime inputs from `codex-0.149.0-r5`. A rollback to that prior image does not require removing the managed helper mapping; use the recorded known-good digest and verify Codex login and project state after reconnecting. Rollbacks to releases older than `0.149.0-r5` still require the GHCR staging below.
+- `codex-0.162.1-r2` retains the GHCR helper and runtime inputs from `codex-0.149.0-r5`. A rollback to that prior image does not require removing the managed helper mapping; use the recorded known-good digest and verify Codex login and project state after reconnecting. Rollbacks to releases older than `0.149.0-r5` still require the GHCR staging below.
 - Never roll an `r5` Home PVC directly to `r4` while `credHelpers["ghcr.io"]="codex-ghcr"` remains: `r4` does not contain that helper. Prepare every ordinal independently while it is still running `r5`.
 - Before legacy-auth scrub, quiesce every writer of `~/.docker/config.json`, run `codex-ghcr-auth disable` as `codex` on each ordinal, confirm only the exact helper mapping is absent, and verify that the untouched legacy `auths["ghcr.io"]` still provides the intended access. Then select the known-good `r4` digest. Keep the GHCR source mounted until rollback acceptance is complete; removing it early makes `r5` fail closed on restart.
 - After legacy-auth scrub, there is no inline credential to resume. Keep the `r5` helper and GHCR source available until another credential path has been established and accepted on every ordinal. Either restore an operator-approved client credential without printing it, or remain on `r5`; only then quiesce external config writers, run `codex-ghcr-auth disable`, and roll to `r4`. Do not reconstruct the old inline auth from logs, backups, or shell arguments.
 - If rolling between two `r5`-compatible releases, the exact helper mapping and runtime Secret contract may remain, but still verify the target image contains `docker-credential-codex-ghcr` before replacement.
 - For a general image rollback, select an older known-good immutable tag or, preferably, its recorded digest after completing any version-specific state migration above.
 - Never delete or overwrite the defective tag as part of normal remediation.
-- When Codex remains `0.162.1`, fix a defect in `r1` with a new `codex-0.162.1-r2`; continue incrementing the revision for later packaging fixes.
+- When Codex remains `0.162.1`, fix a defect in `r2` with a new `codex-0.162.1-r3`; continue incrementing the revision for later packaging fixes.
 - If a workflow cannot prove whether the target tag exists, stop. Resolve registry authentication or availability and rerun the complete publish workflow.
 - If publication partially succeeds, inspect the registry before retrying. Any existing target tag requires a new revision.

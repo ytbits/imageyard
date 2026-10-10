@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-10 - Simplify direct App Server access
+
+- Target immutable `codex-0.162.1-r2`, keeping Codex CLI and base/package versions unchanged.
+- Remove App Server TLS, bearer-token inputs, private credential staging and rotation. The opt-in relay now accepts plain WebSocket connections on port `8787` with only a Devbox URL in the client and no caller Origin filter.
+- Preserve the shared managed daemon, independent recovery, ordinal gate and desktop proxy path. The one-Devbox GitOps canary adds port `8787` to its existing Tailscale-exposed Service for `ws://codex-devbox-2:8787/`; no new Service or business-worker integration is required.
+- This is a review candidate; publication and deployment remain separate steps.
+
 ## 2026-10-10 - Prepare opt-in Codex App Server access
 
 - Target stable Codex CLI `0.162.1` and immutable image `codex-0.162.1-r1`; retain existing Node and Docker pins.

@@ -1,34 +1,20 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { createServer } from 'node:https';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { after, test, type TestContext } from 'node:test';
+import { createServer } from 'node:http';
+import { test, type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import WebSocket, { WebSocketServer } from 'ws';
 import { AppServerClient, OutcomeUnknownError, RpcError, type JsonObject } from './client.ts';
-
-// Test-generated short-lived identity; no production credentials or models.
-const directory = mkdtempSync(join(tmpdir(), 'imageyard-client-test-'));
-execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
-  '-subj', '/CN=app-server.test', '-addext', 'subjectAltName=DNS:app-server.test',
-  '-keyout', join(directory, 'key.pem'), '-out', join(directory, 'cert.pem')],
-{ stdio: 'ignore' });
-const cert = readFileSync(join(directory, 'cert.pem'));
-const key = readFileSync(join(directory, 'key.pem'));
-after(() => rmSync(directory, { recursive: true, force: true }));
 
 type Message = JsonObject & { method?: string; id?: string | number; params?: JsonObject };
 const send = (socket: WebSocket, message: unknown) => socket.send(JSON.stringify(message));
 
 async function fixture(t: TestContext, handle: (socket: WebSocket, message: Message) => void) {
-  const server = createServer({ cert, key });
+  const server = createServer();
   const wss = new WebSocketServer({ server });
   const messages: Message[] = [];
   const sockets: WebSocket[] = [];
   wss.on('connection', (socket, request) => {
-    assert.equal(request.headers.authorization, 'Bearer test-token');
+    assert.equal(request.headers.authorization, undefined);
     sockets.push(socket);
     socket.on('message', (data) => {
       const message = JSON.parse(data.toString()) as Message;
@@ -45,8 +31,7 @@ async function fixture(t: TestContext, handle: (socket: WebSocket, message: Mess
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Missing test address');
   const options = {
-    url: `wss://127.0.0.1:${address.port}/`, token: 'test-token',
-    tlsServerName: 'app-server.test', ca: cert, requestTimeoutMs: 1_000,
+    url: `ws://127.0.0.1:${address.port}/`, requestTimeoutMs: 1_000,
   };
   return { options, messages, sockets };
 }
@@ -164,11 +149,15 @@ test('request and turn deadlines are bounded and do not replay mutations', async
   assert.equal(f.messages.filter((message) => message.method === 'turn/start').length, 1);
 });
 
-test('enforces WSS, trusted CA and certificate identity', async (t) => {
+test('uses a direct WS endpoint without credentials or auxiliary connection inputs', async (t) => {
   const f = await fixture(t, () => {});
-  await assert.rejects(AppServerClient.connect({ ...f.options, url: f.options.url.replace('wss:', 'ws:') }), /WSS/);
-  await assert.rejects(AppServerClient.connect({ ...f.options, ca: undefined }), /connection failed/);
-  await assert.rejects(AppServerClient.connect({ ...f.options, tlsServerName: 'wrong.test' }), /connection failed/);
+  const client = await AppServerClient.connect({ url: f.options.url });
+  t.after(() => client.close());
+  assert.equal(f.messages[0]?.method, 'initialize');
+  for (const url of [f.options.url.replace('ws:', 'https:'), f.options.url.replace('://', '://user@'),
+    `${f.options.url}?query=value`, `${f.options.url}#fragment`]) {
+    await assert.rejects(AppServerClient.connect({ url }), /WS URL/);
+  }
 });
 
 test('unsupported server requests are rejected by default; malformed traffic fails pending calls', async (t) => {

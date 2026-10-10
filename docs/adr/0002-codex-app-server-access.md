@@ -1,28 +1,26 @@
-# ADR 0002: Optional network access to the existing Codex daemon
+# ADR 0002: Direct access to the existing Codex daemon
 
-- Status: Proposed
+- Status: Proposed revision for `codex-0.162.1-r2`
 - Date: 2026-10-10
 
 ## Context
 
-Cluster applications need to create and continue Codex threads without SSH. Desktop already uses each Devbox's managed Unix-socket App Server. Starting another server against the same Home would add competing process ownership and different in-memory thread state. The previous image deliberately started no App Server; this decision introduces an explicit opt-in exception.
+Tailnet clients need to create and continue Codex threads without SSH. Desktop already uses each Devbox's managed Unix-socket App Server. The owner requested a single-user interface on one Devbox, using its existing Tailscale hostname without application tokens, TLS configuration, a new Service or business-worker integration.
 
 ## Decision
 
-Keep default startup unchanged. When enabled, run a small Node HTTPS reverse proxy as `codex` that forwards authenticated WebSocket connections to the existing Unix socket without interpreting JSON-RPC. Require TLS and a distinct bearer token supplied through runtime files. Reject browser Origin headers and never forward the access token upstream.
+Keep default startup unchanged. When explicitly enabled, run a small Node HTTP/WebSocket relay as `codex` on port `8787`, forwarding raw frames to the existing Unix socket. There is no application authentication or encryption. Network reachability grants control of the trusted Devbox environment. Preserve basic framing checks and upstream Unix endpoint validation without caller Origin filtering or additional client configuration.
 
-The optional worker probes the actual upstream WebSocket handshake and uses `codex app-server daemon start` to start a missing daemon. It does not stop an existing daemon or replay client requests. The image supervisor restarts this worker independently of SSH; failure must not create an SSH/readiness dependency loop. Container termination still ends the entire container's processes.
+Use `codex app-server daemon start` to bootstrap a missing managed daemon. Keep relay recovery independent of SSH and retain optional hostname-ordinal gating. Do not create another daemon for the same Home, forcibly stop a running shared daemon, or automatically replay client requests.
 
-Gate canary enablement by hostname ordinal. Keep routing per Devbox: callers retain both endpoint and thread ID. Thread continuation is not an interchangeable, stateless load-balancing operation. A dropped connection has an unknown request outcome until the caller reads state; it is not permission to retry `turn/start` automatically.
-
-Read token/TLS sources at worker launch and stage private copies only under `/run`. The supervisor polls source material every five seconds, stops the worker on revocation or unsafe files, and restarts it after valid changes; callers reconnect. This is trusted single-user remote execution, with the same filesystem authority as the `codex` user, not a per-project authorization service.
+Expose `8787` through the existing Tailscale-annotated Service that selects only `codex-devbox-2`. Tailnet callers use `ws://codex-devbox-2:8787/`; cluster callers can use that Service's Kubernetes DNS name. No new Service, certificate, Vault credential, caller-specific policy or worker configuration is required. Callers retain the originating Devbox and thread ID across reconnects.
 
 ## Consequences and validation
 
-- CLIProxyAPI, account routing, Desktop SSH credentials and state mount identities stay unchanged. Codex manages its own daemon package and session files in Home; the image adds no custom migration of existing user data.
-- The optional gateway is an additional supervised process and secret/certificate lifecycle to maintain. SSH remains available if it fails.
-- Fixed-version client/protocol tests are required because App Server transport is experimental.
-- Disposable validation covers the actual upgraded binary through WSS and SSH-compatible Unix transport, token rejection, TLS validation, concurrent clients, reconnect, daemon/gateway recovery, ordinal gating and disabled defaults. No real inference credentials or research runs are used.
-- Kubernetes Services, network rules, TLS names and canary rollout belong in k3s-gitops. Image publication and live rollout are separate approval steps.
+- The caller supplies one `ws://` endpoint, with no token or certificate configuration. The accepted trust assumption is that processes with network reachability may control Codex.
+- Add one port to the existing Devbox 2 tailnet device while preserving SSH/preview ports, model-provider configuration, Home/Workspace mounts and Docker/GHCR inputs.
+- Process recovery, request correlation, clarification handling and safe reconnect behavior remain necessary for reliable use.
+- Pin Codex `0.162.1`, use a new immutable image revision, and verify both native architectures through actual unauthenticated WebSocket and desktop-proxy protocol reads. No real model task is part of these tests.
+- Image publication, canary activation and live acceptance remain separate delivery steps.
 
-See [the operations runbook](../runbooks/codex-app-server-access.md) and [OpenAI App Server documentation](https://learn.chatgpt.com/docs/app-server).
+See [the runbook](../runbooks/codex-app-server-access.md) and [client example](../../codex-remote-devbox/examples/app-server-client/README.md).

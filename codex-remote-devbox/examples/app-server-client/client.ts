@@ -13,11 +13,6 @@ export type Turn = {
 
 export interface ClientOptions {
   url: string;
-  token: string;
-  /** Certificate identity, when Kubernetes service DNS differs from the SAN. */
-  tlsServerName?: string;
-  /** Private test CA or intentionally configured private CA; verification stays on. */
-  ca?: string | Buffer;
   requestTimeoutMs?: number;
   experimentalApi?: boolean;
   onNotification?: (notification: Notification) => void;
@@ -64,18 +59,13 @@ export class AppServerClient {
 
   private constructor(options: ClientOptions) {
     const url = new URL(options.url);
-    if (url.protocol !== 'wss:' || url.username || url.password || url.search || url.hash) {
-      throw new Error('Use a WSS URL without credentials, query, or fragment.');
+    if (url.protocol !== 'ws:' || url.username || url.password || url.search || url.hash) {
+      throw new Error('Use a WS URL without credentials, query, or fragment.');
     }
-    if (!/^[\x21-\x7e]+$/.test(options.token)) throw new Error('Invalid bearer token.');
     const timeout = options.requestTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Error('Invalid timeout.');
     this.#options = { ...options, requestTimeoutMs: timeout };
-    const socketOptions: WebSocket.ClientOptions & { servername?: string } = {
-      headers: { Authorization: `Bearer ${options.token}` },
-      servername: options.tlsServerName,
-      ca: options.ca,
-      rejectUnauthorized: true,
+    const socketOptions: WebSocket.ClientOptions = {
       followRedirects: false,
       handshakeTimeout: timeout,
       maxPayload: 16 * 1024 * 1024,

@@ -1,28 +1,18 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 const { EventEmitter, once } = require('node:events');
 const fs = require('node:fs');
 const http = require('node:http');
-const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
-const { AppServerGateway, gatewayEnabled, readProjectedSecret, readRuntimeCredentials,
-  websocketAccept } = require('./app-server-gateway.js');
-const { OptionalGatewayService, gatewayLaunch, parseDockerEnvironment, prepareGatewayRuntime } = require('./supervisor.js');
+const { AppServerGateway, gatewayEnabled, websocketAccept } = require('./app-server-gateway.js');
+const { OptionalGatewayService, gatewayLaunch, parseDockerEnvironment } = require('./supervisor.js');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-'));
-const key = path.join(root, 'key.pem');
-const cert = path.join(root, 'cert.pem');
-childProcess.execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
-  '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
-  '-keyout', key, '-out', cert], { stdio: 'ignore' });
-const credentials = { token: crypto.randomBytes(32).toString('base64url'), key: fs.readFileSync(key),
-  cert: fs.readFileSync(cert) };
 let fixtureNumber = 0;
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
@@ -65,23 +55,22 @@ async function fixture(t, { upstream = true, bootstrap = async () => {}, handsha
     server = null;
   }
   if (upstream) await openUpstream();
-  const gateway = new AppServerGateway({ credentials, socketPath, uid: process.getuid(),
+  const gateway = new AppServerGateway({ socketPath, uid: process.getuid(),
     host: '127.0.0.1', port: 0, handshakeTimeoutMs, retryMaxMs: 20, bootstrap });
   await gateway.start();
-  const options = { hostname: '127.0.0.1', port: gateway.server.address().port, ca: credentials.cert,
-    servername: 'localhost', agent: false };
+  const options = { hostname: '127.0.0.1', port: gateway.server.address().port, agent: false };
   t.after(async () => { await gateway.stop(); await closeUpstream(); });
   const get = (url) => new Promise((resolve, reject) => {
-    https.get({ ...options, path: url }, (response) => {
+    http.get({ ...options, path: url }, (response) => {
       response.resume();
       response.once('end', () => resolve(response.statusCode));
     }).once('error', reject);
   });
   const connect = (extraHeaders = {}, url = '/') => new Promise((resolve, reject) => {
-    const request = https.request({ ...options, method: 'GET', path: url, headers: {
+    const request = http.request({ ...options, method: 'GET', path: url, headers: {
       Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13',
       'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
-      Authorization: `Bearer ${credentials.token}`, ...extraHeaders,
+      ...extraHeaders,
     } });
     request.once('upgrade', (_response, socket, head) => { socket.on('error', () => {}); resolve({ status: 101, socket, head }); });
     request.once('response', (response) => { response.resume(); resolve({ status: response.statusCode }); });
@@ -101,7 +90,7 @@ test('opt-in is limited to the requested ordinal and never implicitly starts oth
   assert.throws(() => gatewayEnabled({ ...env, CODEX_APP_SERVER_ORDINAL: '../../2' }));
 });
 
-test('authenticated TLS WebSocket relays bytes unchanged and strips credentials upstream', async (t) => {
+test('plain WebSocket connects without credentials and relays bytes unchanged', async (t) => {
   const f = await fixture(t);
   assert.equal(await f.get('/livez'), 200);
   assert.equal(await f.get('/readyz'), 200);
@@ -124,17 +113,21 @@ test('authenticated TLS WebSocket relays bytes unchanged and strips credentials 
   socket.destroy();
 });
 
-test('missing/wrong/duplicate auth, every Origin, and unsupported paths fail before upstream', async (t) => {
+test('valid WebSocket upgrades with an Origin header are accepted', async (t) => {
+  const f = await fixture(t);
+  for (const origin of ['https://caller.example', 'null', '']) {
+    const { status, socket } = await f.connect({ Origin: origin });
+    assert.equal(status, 101);
+    socket.destroy();
+  }
+});
+
+test('unsupported handshake fails before upstream', async (t) => {
   const f = await fixture(t);
   await f.gateway.probe();
   const before = f.requests.length;
   const cases = [
-    [{ Authorization: '' }, '/', 401],
-    [{ Authorization: `Bearer ${'x'.repeat(32)}` }, '/', 401],
-    [{ Authorization: [`Bearer ${credentials.token}`, `Bearer ${credentials.token}`] }, '/', 401],
-    [{ Origin: 'https://localhost' }, '/', 403],
-    [{ Origin: '' }, '/', 403],
-    [{}, '/?token=ignored', 400],
+    [{}, '/?ignored=yes', 400],
     [{ 'Sec-WebSocket-Protocol': 'jsonrpc' }, '/', 400],
     [{ 'Sec-WebSocket-Key': 'invalid' }, '/', 400],
   ];
@@ -198,37 +191,6 @@ test('shutdown closes active relays and cancels further daemon bootstrap', async
   assert.equal(f.gateway.ready, false);
 });
 
-test('projected credentials stay inside the mount and runtime copies use private metadata', () => {
-  const directory = path.join(root, String(fixtureNumber++));
-  fs.mkdirSync(directory, { mode: 0o700 });
-  const source = path.join(directory, 'source');
-  const generation = path.join(source, '..generation');
-  fs.mkdirSync(source); fs.mkdirSync(generation);
-  const fields = { token: credentials.token, 'tls.crt': credentials.cert, 'tls.key': credentials.key };
-  for (const [name, value] of Object.entries(fields)) {
-    fs.writeFileSync(path.join(generation, name), value, { mode: 0o400 });
-    fs.symlinkSync(`..generation/${name}`, path.join(source, name));
-  }
-  const env = { CODEX_APP_SERVER_TOKEN_FILE: path.join(source, 'token'),
-    CODEX_APP_SERVER_TLS_CERT_FILE: path.join(source, 'tls.crt'),
-    CODEX_APP_SERVER_TLS_KEY_FILE: path.join(source, 'tls.key') };
-  const runtime = path.join(directory, 'runtime');
-  const options = { directory: runtime, sourceDirectory: source, sourceUid: process.getuid(),
-    parentUid: process.getuid(), uid: process.getuid(), gid: process.getgid() };
-  const original = prepareGatewayRuntime(env, options);
-  assert.equal(readRuntimeCredentials(runtime, process.getuid()).token, credentials.token);
-  assert.equal(fs.statSync(path.join(runtime, 'token')).mode & 0o777, 0o600);
-  fs.chmodSync(path.join(generation, 'token'), 0o600);
-  fs.writeFileSync(path.join(generation, 'token'), crypto.randomBytes(32).toString('hex'));
-  fs.chmodSync(path.join(generation, 'token'), 0o400);
-  assert.notEqual(prepareGatewayRuntime(env, options), original);
-  fs.chmodSync(path.join(generation, 'token'), 0o444);
-  assert.throws(() => prepareGatewayRuntime(env, options));
-  fs.unlinkSync(path.join(source, 'token'));
-  fs.symlinkSync(key, path.join(source, 'token'));
-  assert.throws(() => readProjectedSecret(path.join(source, 'token'), { root: source, uid: process.getuid() }));
-});
-
 function fakeChild() {
   const child = new EventEmitter();
   child.exitCode = null; child.signalCode = null;
@@ -240,25 +202,21 @@ function fakeChild() {
   return child;
 }
 
-test('optional service retries independently, replaces rotated credentials, and stops cleanly', async () => {
+test('optional service retries independently after startup and runtime failures, then stops cleanly', async () => {
   let calls = 0;
-  let signature = 'first';
   const children = [];
-  const service = new OptionalGatewayService({ retryMs: 5, maxRetryMs: 10, credentialPollMs: 5,
-    listenTimeoutMs: 100, log: () => {}, currentSignature: () => signature,
-    launch: () => {
-      if (++calls === 1) throw new Error('missing secret');
+  const service = new OptionalGatewayService({ retryMs: 5, maxRetryMs: 10,
+    listenTimeoutMs: 100, log: () => {}, launch: () => {
+      if (++calls === 1) throw new Error('worker unavailable');
       const child = fakeChild();
-      child.gatewaySignature = signature;
       children.push(child);
       queueMicrotask(() => child.emit('message', { type: 'listening' }));
       return child;
     } });
   service.start();
   await waitFor(() => children.length === 1);
-  signature = 'second';
+  children[0].kill('SIGTERM');
   await waitFor(() => children.length === 2);
-  assert.equal(children[0].signalCode, 'SIGTERM');
   await service.stop();
   const stopped = calls;
   await delay(30);
@@ -282,36 +240,9 @@ test('optional gateway launch clears ambient configuration and uses the trusted 
   }
   assert.equal(spec.options.env.HOME, '/home/codex');
   assert.equal(spec.options.env.CODEX_HOME, undefined);
-  assert.equal(spec.options.env.CODEX_APP_SERVER_TOKEN_FILE, undefined);
   assert.deepEqual(spec.options.stdio, ['ignore', 'ignore', 'inherit', 'ipc']);
 });
 
-
-test('credential revocation closes the gateway and prevents retries from exposing stale secrets', async () => {
-  let revoked = false;
-  let launches = 0;
-  const children = [];
-  const service = new OptionalGatewayService({ retryMs: 5, maxRetryMs: 10, credentialPollMs: 5,
-    listenTimeoutMs: 100, log: () => {},
-    currentSignature: () => { if (revoked) throw new Error('source removed'); return 'present'; },
-    launch: () => {
-      launches++;
-      if (revoked) throw new Error('source removed');
-      const child = fakeChild();
-      child.gatewaySignature = 'present';
-      children.push(child);
-      queueMicrotask(() => child.emit('message', { type: 'listening' }));
-      return child;
-    } });
-  service.start();
-  await waitFor(() => children.length === 1);
-  revoked = true;
-  await waitFor(() => children[0].signalCode === 'SIGTERM' && launches > 1);
-  assert.equal(children.length, 1);
-  revoked = false;
-  await waitFor(() => children.length === 2);
-  await service.stop();
-});
 
 test('an optional worker that never opens its listener is reaped and retried', async () => {
   const children = [];

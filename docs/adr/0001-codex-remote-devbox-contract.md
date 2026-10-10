@@ -22,7 +22,7 @@ The image must provide a stable remote-user contract, accept credentials only at
 - Publish the remote-Docker client layer as revision `codex-0.149.0-r3`, without changing Codex or any `r2` state, SSH-server, process, signal, or no-init-container behavior.
 - Publish the supervised, Testcontainers-compatible Unix bridge as revision `codex-0.149.0-r4`, preserving Codex `0.149.0`, the exact nine-file Docker-host input contract, and the existing state and inbound-SSH interfaces.
 - Publish automatic runtime GHCR client authentication as revision `codex-0.149.0-r5`, preserving Codex, the remote-Docker bridge, both state mounts, and the inbound-SSH interface.
-- Upgrade Codex to `0.162.1` as current release `codex-0.162.1-r1`, preserving the `0.149.0-r5` runtime contracts, pinned Node base, and pinned Docker packages.
+- Upgrade Codex to `0.162.1` as current release `codex-0.162.1-r2`, preserving the `0.149.0-r5` runtime contracts, pinned Node base, and pinned Docker packages.
 - Reset the revision to `r1` when Codex changes. Increment the revision when packaging changes while the Codex version remains unchanged.
 - Do not publish moving tags such as `latest` or `stable`.
 
@@ -40,7 +40,7 @@ The image must provide a stable remote-user contract, accept credentials only at
 - Accept one or more bare OpenSSH public-key lines in the authorized-keys input. Reject per-key options and non-public-key file formats.
 - Fail closed when either required key is missing, empty, invalid, or unsafe to use. Do not generate an ephemeral host identity or log key material.
 - Permit public-key authentication only. Disable root, password, keyboard-interactive, agent forwarding, X11 forwarding, remote forwarding, banners, and MOTD output. Permit local forwarding only to loopback destinations on the devbox.
-- Default mode does not start or expose App Server. [ADR 0002](0002-codex-app-server-access.md) adds an explicit opt-in WSS gateway and managed Unix daemon startup while preserving Desktop SSH access.
+- Default mode does not start or expose App Server. [ADR 0002](0002-codex-app-server-access.md) adds an explicit opt-in plain WebSocket relay and managed Unix daemon startup while preserving Desktop SSH access.
 - After validation and state bootstrap, have the supervisor prepare the private bridge runtime directory, remove only a verified stale Unix socket, start the bridge as UID/GID `1000`, wait for its ready socket, and then start foreground sshd as root. Treat an unexpected bridge or sshd exit as fatal, terminate the sibling, and exit nonzero. Forward container termination through bounded `TERM` then `KILL` cleanup for both services and all per-connection SSH children.
 - Require the Docker-host bundle at `/run/secrets/docker-host` with the exact files `docker_host`, `ssh_alias`, `ssh_host`, `ssh_port`, `ssh_user`, `ssh_client_ed25519_private_key`, `ssh_client_ed25519_fingerprint`, `ssh_host_ed25519_fingerprint`, and `ssh_known_hosts`. Each input is a regular, non-symlink, nonempty read-only source.
 - Fix both the image-owned SSH alias and `HostKeyAlias` to `docker-host`; keep `HostName` as the separately configured MagicDNS host. Validate safe field syntax, an Ed25519 client key and its derived fingerprint, and exactly one Ed25519 known-hosts entry keyed by `docker-host` and matching the stored host fingerprint. Never log those values.
