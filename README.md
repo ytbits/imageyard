@@ -59,7 +59,7 @@ imageyard/
 
 The `codex-remote-devbox/` directory defines an SSH-accessible development environment for Codex Desktop remote connections:
 
-- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r1`
+- Image: `ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r2`
 - Dockerfile and build context: `codex-remote-devbox/Dockerfile` and `codex-remote-devbox/`
 - Base: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
 - Codex CLI: `@openai/codex@0.162.1`
@@ -71,7 +71,7 @@ The `codex-remote-devbox/` directory defines an SSH-accessible development envir
 - Runtime Docker-host bundle: `/run/secrets/docker-host/`
 - Runtime GHCR bundle: `/run/secrets/ghcr/ghcr_username` and `/run/secrets/ghcr/ghcr_pat`
 
-The proposed release upgrades Codex CLI from `0.157.1` to stable `0.162.1` and adds an opt-in authenticated App Server network gateway. The pinned Node base, Docker clients, existing SSH interface, GHCR helper and state mounts remain unchanged. Image publication and deployment require separate approval; this tag is a release target until publication succeeds.
+The proposed `r2` release retains Codex CLI `0.162.1` and simplifies the opt-in App Server relay to plain WebSocket access without a token or TLS. The pinned Node base, Docker clients, existing SSH interface, GHCR helper and state mounts remain unchanged. Image publication and deployment require separate approval; this tag is a release target until publication succeeds.
 
 Both state paths must be explicit mountpoints; image-layer directories or a mount on only a parent path do not satisfy the contract. After validating the fixed identity, mount types, runtime keys, and OpenSSH configuration, the root entrypoint bootstraps only the two mount roots to UID/GID `1000` and mode `0700`, then verifies that `codex` can create and remove a temporary probe. Bootstrap is nonrecursive: it never seeds, wipes, changes, or migrates existing descendants. A missing, non-directory, symlinked, non-mountpoint, read-only, or otherwise unusable state root fails closed before SSH starts.
 
@@ -91,9 +91,9 @@ The image also includes a lean Node, Python, Git, GitHub CLI, SSH, and build too
 
 The bridge is a transport boundary, not a Docker-tenancy boundary. Devboxes that share this credential target the same Mac daemon and therefore share daemon-wide container names and state, networks, images, volumes, build cache, and CPU/memory contention. Testcontainers and `-p` published ports bind on the Mac Docker host and may be reachable by LAN or tailnet peers according to Docker Desktop, host-firewall, and tailnet policy. Revision `r5` adds no Kubernetes-side Docker TCP exposure; the private local Unix socket and per-client GHCR credential do not isolate one Devbox's Docker activity or already-cached private layers from another.
 
-By default, Codex Desktop starts its app server through SSH and no App Server TCP port is opened. Enabling `CODEX_APP_SERVER_ENABLED=1` adds an HTTPS/WebSocket gateway on port `8443`, forwarding to the same managed Unix-socket daemon. The optional worker starts/restarts the daemon through its idempotent CLI command and recovers independently of SSH. A hostname ordinal selector supports single-Devbox adoption. See [App Server access](docs/runbooks/codex-app-server-access.md) for TLS, token, readiness, rotation and client use, and [ADR 0002](docs/adr/0002-codex-app-server-access.md) for the changed startup contract.
+By default, Codex Desktop starts its app server through SSH and no App Server TCP port is opened. Enabling `CODEX_APP_SERVER_ENABLED=1` adds a plain WebSocket relay on port `8787`, forwarding to the same managed Unix-socket daemon. The optional worker starts a missing daemon through its idempotent CLI command and recovers independently of SSH. `CODEX_APP_SERVER_ORDINAL=2` can restrict enablement to one Devbox. This trusted-network mode has no application token, TLS certificate or credential mounts: callers need only the chosen Devbox URL. See [App Server access](docs/runbooks/codex-app-server-access.md).
 
-Both architectures retain the authenticated SSH stdio protocol smoke. The optional gateway adds disposable TLS/authentication, concurrent connection and recovery checks without real credentials or inference calls.
+Both architectures retain the authenticated SSH stdio protocol smoke. The optional relay adds direct WebSocket, concurrent connection, Desktop coexistence and recovery checks without App Server credentials or inference calls.
 
 Codex remote devbox tags have the immutable form `codex-<CODEX_VERSION>-r<REVISION>`. A Codex upgrade resets the revision to `r1`; packaging-only changes increment it. The project never publishes `latest`, `stable`, or another moving alias.
 

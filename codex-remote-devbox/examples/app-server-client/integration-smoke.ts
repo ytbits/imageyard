@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { AppServerClient } from './client.ts';
 
 // Explicit test-only command for an isolated unauthenticated container fixture.
@@ -8,14 +7,8 @@ import { AppServerClient } from './client.ts';
 const clients: AppServerClient[] = [];
 try {
   const url = process.env.CODEX_APP_SERVER_URL;
-  const tokenFile = process.env.CODEX_APP_SERVER_TOKEN_FILE;
-  if (!url || !tokenFile) throw new Error('Endpoint and token file required.');
-  const options = {
-    url,
-    token: readFileSync(tokenFile, 'utf8').trim(),
-    tlsServerName: process.env.CODEX_APP_SERVER_TLS_SERVER_NAME,
-    ca: process.env.CODEX_APP_SERVER_CA_FILE ? readFileSync(process.env.CODEX_APP_SERVER_CA_FILE) : undefined,
-  };
+  if (!url) throw new Error('Endpoint required.');
+  const options = { url };
   clients.push(await AppServerClient.connect(options));
   clients.push(await AppServerClient.connect(options));
   for (const client of clients) {

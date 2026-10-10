@@ -1,39 +1,38 @@
-# Optional Codex App Server network access
+# Direct Codex App Server access
 
-This is an opt-in runtime feature of the proposed `codex-0.162.1-r1` image. Its presence in a PR is not publication or deployment evidence. Default containers keep their existing SSH-only startup.
+The proposed `codex-0.162.1-r2` image provides an opt-in plain WebSocket relay to the existing managed daemon. Default containers keep SSH-only startup. This review candidate is not publication or deployment evidence.
 
-## Runtime inputs
+## Start and connect
+
+Only two runtime settings exist:
 
 | Setting | Meaning |
 | --- | --- |
-| `CODEX_APP_SERVER_ENABLED=1` | Enable the optional daemon manager and WSS gateway. Omit to keep it off. |
+| `CODEX_APP_SERVER_ENABLED=1` | Start the relay and ensure the managed daemon is running. Omit to keep it off. |
 | `CODEX_APP_SERVER_ORDINAL=2` | Optional restriction to hostname `codex-devbox-2`. Other ordinals stay off. |
-| `CODEX_APP_SERVER_TOKEN_FILE` | Source token, default `/run/secrets/app-server/token`. |
-| `CODEX_APP_SERVER_TLS_CERT_FILE` | PEM certificate chain, default `/run/secrets/app-server/tls.crt`. |
-| `CODEX_APP_SERVER_TLS_KEY_FILE` | PEM private key, default `/run/secrets/app-server/tls.key`. |
 
-Supply a distinct high-entropy access token, not a Codex login or model-provider credential. Mount root-owned read-only files; use mode `0400` for the token/key. Kubernetes projected Secret symlinks are supported when they resolve inside the source directory to safe root-owned files. The supervisor stages private UID/GID `1000` copies under `/run/codex-remote-devbox/app-server`; it never persists them in Home/Workspace or prints them.
+The relay listens on `0.0.0.0:8787`, accepts WebSocket upgrades at `/`, and forwards raw frames to `/home/codex/.codex/app-server-control/app-server-control.sock`. There is no App Server token, TLS certificate, Secret mount, dedicated hostname certificate, or credential rotation. Any process able to reach the port can control this trusted Codex environment. Browser Origin requests remain rejected; this endpoint is intended for service clients.
 
-The gateway listens on TLS port `8443`, accepts WebSocket upgrades at `/` with `Authorization: Bearer ...`, and forwards to `/home/codex/.codex/app-server-control/app-server-control.sock`. The managed daemon may make that path a symlink to its protected per-user temporary directory. A successful upgrade preserves the original bidirectional JSON-RPC stream. Browser Origin requests are rejected.
+For the current Kubernetes StatefulSet, a caller Pod can use the existing per-Pod DNS:
 
-## Startup, health and rotation
+```text
+ws://codex-devbox-2.codex-devbox-headless.codex-devbox.svc:8787/
+```
 
-The supervisor starts the optional worker independently of SSH. When the daemon is unavailable, the worker calls its official idempotent start command as `codex`, with bounded attempts and backoff. A bad token/certificate bundle fails the gateway closed; it must not block SSH. A gateway restart does not intentionally stop the shared daemon or cancel its threads.
+The existing headless Service provides DNS for each named Pod. This address resolves directly to ordinal 2; it does not load-balance among Devboxes and requires no new Service or port added to the headless Service. Do not use the bare headless Service name, which can resolve multiple Pods. A direct Pod IP also works but may change after replacement. See [Kubernetes stable network identity](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-network-id).
 
-`GET /livez` checks the gateway process. `GET /readyz` verifies that the Unix daemon accepts a WebSocket handshake. Neither endpoint reads credentials or invokes a model. A successful health check is not proof that inference authentication or a particular project is ready. Do not make gateway readiness remove the whole Devbox from its existing SSH Service.
+This address is for callers on the Pod network. It does not create a new route through the existing Tailscale SSH/preview proxies. Keep those existing Services and routes unchanged. Callers with restricted egress need a separately scoped allow rule when integrated.
 
-The supervisor checks source files every five seconds. Changed material restarts only the gateway worker with fresh private copies; deleted or unsafe material stops that worker until valid credentials return. Reconnect clients after token/certificate rotation. Existing WebSockets close during a gateway restart; read thread state after reconnect before retrying a potentially accepted operation. A full container replacement also interrupts daemon execution; persistent sessions survive only to their saved checkpoint.
+Use the [TypeScript client](../../codex-remote-devbox/examples/app-server-client/README.md). Supply only `CODEX_APP_SERVER_URL` for the read-only smoke command. Initialize each connection once, then start or resume a thread on the selected Devbox. Persist `devbox identity/endpoint + threadId`; reconnect to the same ordinal and reconcile state before retrying an uncertain operation. Clarification/approval handlers and task acceptance belong to the calling application.
 
-## Client and network deployment
+## Lifecycle
 
-Use the [standalone TypeScript example](../../codex-remote-devbox/examples/app-server-client/README.md). Initialize each connection once, then start/resume the required thread and read notifications and server requests. Clarification and approval requests need an explicit application handler; the example does not automatically grant approval.
+The optional worker uses `codex app-server daemon start` when the Unix daemon is unavailable. The official command owns daemon identity and locking. Relay recovery is independent of SSH; restarting the relay does not intentionally stop the shared daemon. An unresponsive but still-running daemon is surfaced as unavailable rather than forcibly killed. The daemon receives the same image-owned Docker/Testcontainers environment as SSH sessions.
 
-A cluster-only deployment can connect to `wss://codex-app-server-2.codex-devbox.svc:8443` with TLS `servername` set to the certificate's internal domain, such as `codex-app-server-2.internal.rewardsentry.com`. Hostname and trust verification remain enabled. This avoids publishing the service or changing public DNS. Mount the token in the caller and restrict network access separately. Do not add this port to an existing Tailscale-exposed Service unintentionally.
+`GET /livez` checks the relay process. `GET /readyz` verifies that the Unix daemon accepts a WebSocket handshake. Neither invokes a model; readiness does not prove inference authentication or project readiness. Do not couple these checks to whole-Pod SSH readiness. Replacing the container interrupts connections and execution; persistent sessions resume only from saved state.
 
-Persist `devbox/endpoint + threadId`. Reconnect and resume on the same Devbox; never randomly distribute an existing thread among independent Homes. Do not automatically replay mutating RPCs after timeout/disconnection. The protocol reports turn completion, not business-level research acceptance.
+## Validation and rollout
 
-## Validation and rollout boundary
+Run unit/client tests and the complete native amd64/arm64 disposable container smoke. It exercises plain WebSocket RPCs without an Authorization header or credential files, simultaneous desktop proxy/network clients, reconnect, daemon/relay recovery and the ordinal gate. Preserve existing SSH/Docker/GHCR/state checks. No model call is needed.
 
-Run static/unit/client tests plus the complete disposable container smoke on native arm64 and amd64. The gateway fixture uses generated local TLS/token material, a real unauthenticated Codex daemon and protocol reads; no model request is required. Check simultaneous Unix/Desktop-compatible and network access, invalid credentials, reconnect, daemon termination/recovery, gateway termination/recovery, ordinal mismatch and disabled behavior. Preserve all existing SSH/Docker/GHCR/state tests.
-
-For a live canary, first publish the separately approved immutable image, record its registry index digest, provision its runtime token/certificate and render the k3s-gitops canary with that exact reference. Review the render before enabling one ordinal. Live model/session acceptance and Desktop UI confirmation occur only after deployment approval; local protocol tests are not evidence of either.
+After separate publication approval, record the new immutable registry digest and prepare the inactive k3s-gitops canary. It modifies only the ordinal-2 workload template with a partition of `2`; no new Service, NetworkPolicy, Vault resource or Certificate is needed. Live Pod DNS, caller access, saved-thread continuation and Desktop UI acceptance occur after deployment approval.

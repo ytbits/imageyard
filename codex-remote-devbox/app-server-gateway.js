@@ -1,20 +1,17 @@
 #!/usr/local/bin/node
 'use strict';
 
-// Transport only: JSON-RPC and WebSocket frames pass through unchanged.
+// Trusted-network transport only: no authentication or TLS. JSON-RPC and
+// WebSocket frames pass through unchanged to this Devbox's managed daemon.
 const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
-const https = require('node:https');
 const os = require('node:os');
 const net = require('node:net');
 const path = require('node:path');
-const tls = require('node:tls');
 
 const SOCKET_PATH = '/home/codex/.codex/app-server-control/app-server-control.sock';
-const SECRET_DIRECTORY = '/run/secrets/app-server';
-const RUNTIME_DIRECTORY = '/run/codex-remote-devbox/app-server';
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const HANDSHAKE_TIMEOUT_MS = 3000;
 const BOOTSTRAP_TIMEOUT_MS = 15000;
@@ -29,56 +26,6 @@ function gatewayEnabled(environment = process.env, hostname = os.hostname()) {
   return hostname === `codex-devbox-${ordinal}`;
 }
 
-function sourcePaths(environment = process.env) {
-  return {
-    token: environment.CODEX_APP_SERVER_TOKEN_FILE || `${SECRET_DIRECTORY}/token`,
-    cert: environment.CODEX_APP_SERVER_TLS_CERT_FILE || `${SECRET_DIRECTORY}/tls.crt`,
-    key: environment.CODEX_APP_SERVER_TLS_KEY_FILE || `${SECRET_DIRECTORY}/tls.key`,
-  };
-}
-
-// Projected Kubernetes Secret links are intentional. Their final targets must
-// stay inside this dedicated mount; arbitrary links into Home are not accepted.
-function readProjectedSecret(file, { root = SECRET_DIRECTORY, uid = 0, sensitive = true } = {}) {
-  if (!path.isAbsolute(file) || !file.startsWith(`${root}/`)) throw new Error('invalid secret path');
-  const resolved = fs.realpathSync(file);
-  if (!resolved.startsWith(`${fs.realpathSync(root)}/`)) throw new Error('secret target escapes mount');
-  const descriptor = fs.openSync(resolved, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-  try {
-    const stat = fs.fstatSync(descriptor);
-    if (!stat.isFile() || stat.uid !== uid || stat.nlink !== 1 ||
-        (stat.mode & 0o022) !== 0 || (sensitive && (stat.mode & 0o077) !== 0) ||
-        stat.size < 1 || stat.size > 65536) throw new Error('unsafe secret metadata');
-    return fs.readFileSync(descriptor);
-  } finally { fs.closeSync(descriptor); }
-}
-
-function validateCredentials(credentials) {
-  const token = credentials.token.toString('utf8').replace(/\r?\n$/, '');
-  if (!/^[A-Za-z0-9._~+\/=\-]{32,256}$/.test(token)) throw new Error('invalid gateway token');
-  tls.createSecureContext({ cert: credentials.cert, key: credentials.key, minVersion: 'TLSv1.2' });
-  return { ...credentials, token };
-}
-
-function readRuntimeCredentials(directory = RUNTIME_DIRECTORY, uid = 1000) {
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid ||
-      (stat.mode & 0o777) !== 0o700) throw new Error('unsafe gateway runtime directory');
-  const values = {};
-  for (const [name, file] of Object.entries({ token: 'token', cert: 'tls.crt', key: 'tls.key' })) {
-    const descriptor = fs.openSync(path.join(directory, file), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    try {
-      const metadata = fs.fstatSync(descriptor);
-      if (!metadata.isFile() || metadata.uid !== uid || metadata.nlink !== 1 ||
-          (metadata.mode & 0o777) !== 0o600 || metadata.size < 1 || metadata.size > 65536) {
-        throw new Error('unsafe gateway runtime credential');
-      }
-      values[name] = fs.readFileSync(descriptor);
-    } finally { fs.closeSync(descriptor); }
-  }
-  return validateCredentials(values);
-}
-
 function hasHeader(request, name) {
   return request.rawHeaders.some((value, index) => index % 2 === 0 && value.toLowerCase() === name);
 }
@@ -86,22 +33,18 @@ function headerCount(request, name) {
   return request.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === name).length;
 }
 function websocketAccept(key) { return crypto.createHash('sha1').update(key + GUID).digest('base64'); }
-function tokenDigest(value) { return crypto.createHash('sha256').update(value).digest(); }
 
 class AppServerGateway {
-  constructor({ credentials, socketPath = SOCKET_PATH, uid = 1000, host = '0.0.0.0', port = 8443,
+  constructor({ socketPath = SOCKET_PATH, uid = 1000, host = '0.0.0.0', port = 8787,
     handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS, retryMaxMs = RETRY_MAX_MS,
     bootstrap = startDaemon, onReady = () => {}, onFatal = () => {}, log = () => {} }) {
-    this.credentials = validateCredentials(credentials);
-    this.digest = tokenDigest(this.credentials.token);
     Object.assign(this, { socketPath, uid, host, port, handshakeTimeoutMs, retryMaxMs, bootstrap, onReady, onFatal, log });
     this.connections = new Set();
     this.pending = new Set();
     this.closing = false;
     this.ready = false;
     this.retryMs = 1000;
-    this.server = https.createServer({ cert: credentials.cert, key: credentials.key, minVersion: 'TLSv1.2',
-      maxHeaderSize: 8192, headersTimeout: 5000, requestTimeout: 5000, connectionsCheckingInterval: 1000 }, (request, response) => {
+    this.server = http.createServer({ maxHeaderSize: 8192, headersTimeout: 5000, requestTimeout: 5000, connectionsCheckingInterval: 1000 }, (request, response) => {
       request.resume();
       response.setHeader('Cache-Control', 'no-store');
       if (request.method !== 'GET') { response.writeHead(405).end(); return; }
@@ -119,7 +62,6 @@ class AppServerGateway {
       socket.once('close', () => this.connections.delete(socket));
     });
     this.server.on('clientError', (_error, socket) => socket.destroy());
-    this.server.on('tlsClientError', () => {});
     this.server.maxConnections = MAX_CONNECTIONS;
   }
 
@@ -202,10 +144,6 @@ class AppServerGateway {
     socket.on('error', () => {});
     if (this.closing) { reject('503 Service Unavailable'); return; }
     if (hasHeader(request, 'origin')) { reject('403 Forbidden'); return; }
-    const auth = request.headers.authorization;
-    const token = typeof auth === 'string' && /^Bearer ([A-Za-z0-9._~+\/=\-]{32,256})$/i.exec(auth);
-    if (headerCount(request, 'authorization') !== 1 || !token ||
-        !crypto.timingSafeEqual(tokenDigest(token[1]), this.digest)) { reject('401 Unauthorized'); return; }
     const key = request.headers['sec-websocket-key'];
     if (request.method !== 'GET' || request.url !== '/' || request.headers.upgrade?.toLowerCase() !== 'websocket' ||
         request.headers['sec-websocket-version'] !== '13' || typeof key !== 'string' ||
@@ -321,7 +259,7 @@ function startDaemon(signal) {
 async function main() {
   if (process.getuid() !== 1000 || process.getgid() !== 1000 || process.env.HOME !== '/home/codex' ||
       process.env.CODEX_HOME || process.argv.length !== 2) throw new Error('invalid gateway identity');
-  const gateway = new AppServerGateway({ credentials: readRuntimeCredentials(),
+  const gateway = new AppServerGateway({
     onReady: (ready) => { if (process.connected) process.send({ type: 'ready', ready }); },
     onFatal: () => { process.exitCode = 1; if (process.connected) process.disconnect(); },
     log: (message) => process.stderr.write(`codex-app-server-gateway: ${message}\n`) });
@@ -342,6 +280,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { AppServerGateway, RUNTIME_DIRECTORY, SECRET_DIRECTORY, SOCKET_PATH,
-  dockerEnvironment, gatewayEnabled, readProjectedSecret, readRuntimeCredentials, sourcePaths, startDaemon, validateCredentials,
-  websocketAccept };
+module.exports = { AppServerGateway, SOCKET_PATH, dockerEnvironment, gatewayEnabled, startDaemon, websocketAccept };

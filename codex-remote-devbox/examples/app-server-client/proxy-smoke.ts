@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import type { Socket } from 'node:net';
 import { Duplex } from 'node:stream';
 import WebSocket from 'ws';
@@ -79,13 +78,8 @@ try {
   socket.send(JSON.stringify({ method: 'initialized' }));
   if (process.env.CODEX_APP_SERVER_URL) {
     phase = 'concurrent network connection';
-    const tokenFile = process.env.CODEX_APP_SERVER_TOKEN_FILE;
-    if (!tokenFile) throw new Error('Network fixture token file required.');
     networkClient = await AppServerClient.connect({
       url: process.env.CODEX_APP_SERVER_URL,
-      token: readFileSync(tokenFile, 'utf8').trim(),
-      tlsServerName: process.env.CODEX_APP_SERVER_TLS_SERVER_NAME,
-      ca: process.env.CODEX_APP_SERVER_CA_FILE ? readFileSync(process.env.CODEX_APP_SERVER_CA_FILE) : undefined,
       requestTimeoutMs: 5_000,
     });
     assert.ok((await networkClient.request('config/read', { includeLayers: false })).config);
