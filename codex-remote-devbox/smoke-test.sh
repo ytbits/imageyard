@@ -2,8 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1}"
-expected_codex_version="${EXPECTED_CODEX_VERSION:-0.157.1}"
+image="${1:-ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r1}"
+expected_codex_version="${EXPECTED_CODEX_VERSION:-0.162.1}"
 expected_docker_ce_cli_version="${EXPECTED_DOCKER_CLI_PACKAGE_VERSION:-5:29.7.2-1~debian.12~bookworm}"
 expected_docker_buildx_version="${EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION:-0.36.1-1~debian.12~bookworm}"
 expected_docker_compose_version="${EXPECTED_DOCKER_COMPOSE_PACKAGE_VERSION:-5.5.0-1~debian.12~bookworm}"
@@ -768,6 +768,11 @@ start_container() {
   local container_workspace_volume="$3"
   local docker_host_bundle="${4:-$fixture_dir/docker-host}"
   local container_network="${5:-bridge}"
+  if [ "$#" -gt 5 ]; then
+    shift 5
+  else
+    set --
+  fi
 
   docker run --detach \
     --name "$container_name" \
@@ -785,6 +790,7 @@ start_container() {
     --mount "type=bind,src=$fixture_dir/ghcr,dst=/run/secrets/ghcr,readonly" \
     --mount "type=volume,src=$container_home_volume,dst=/home/codex,volume-nocopy" \
     --mount "type=volume,src=$container_workspace_volume,dst=/workspaces,volume-nocopy" \
+    "$@" \
     "$image" >/dev/null
 }
 
@@ -2876,6 +2882,10 @@ assert_seed_preserved "$invalid_secret_home_volume" invalid-home 345:678 543:876
 assert_seed_preserved "$invalid_secret_workspace_volume" invalid-workspaces 456:789 654:987 invalid-workspace-seed
 assert_no_probe_leftovers "$invalid_secret_home_volume"
 assert_no_probe_leftovers "$invalid_secret_workspace_volume"
+
+# This opt-in fixture uses a separate Home, generated TLS and protocol reads only.
+source "$script_dir/app-server-gateway-smoke.sh"
+run_app_server_gateway_smoke
 
 for observed_container in \
   "$primary_container" \

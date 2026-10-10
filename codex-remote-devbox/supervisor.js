@@ -2,11 +2,16 @@
 'use strict';
 
 const childProcess = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 const { SOCKET_DIR, SOCKET_PATH, validateRemoteSocketPath } = require('./docker-bridge.js');
 
+const { dockerEnvironment, gatewayEnabled, readProjectedSecret, sourcePaths, validateCredentials,
+  RUNTIME_DIRECTORY: GATEWAY_RUNTIME_DIRECTORY, SECRET_DIRECTORY } = require('./app-server-gateway.js');
+
+const GATEWAY_PATH = '/usr/local/libexec/app-server-gateway.js';
 const NODE_PATH = '/usr/local/bin/node';
 const BRIDGE_PATH = '/usr/local/libexec/docker-bridge.js';
 const GHCR_CONFIGURATOR_PATH = '/usr/local/bin/codex-ghcr-auth';
@@ -229,6 +234,156 @@ function bridgeLaunch(remoteSocketPath) {
   };
 }
 
+function gatewaySourceCredentials(environment = process.env, sourceDirectory = SECRET_DIRECTORY, sourceUid = 0) {
+  const paths = sourcePaths(environment);
+  return validateCredentials({
+    token: readProjectedSecret(paths.token, { root: sourceDirectory, uid: sourceUid }),
+    cert: readProjectedSecret(paths.cert, { root: sourceDirectory, uid: sourceUid, sensitive: false }),
+    key: readProjectedSecret(paths.key, { root: sourceDirectory, uid: sourceUid }),
+  });
+}
+
+function credentialSignature(credentials) {
+  const hash = crypto.createHash('sha256');
+  for (const name of ['token', 'cert', 'key']) {
+    hash.update(String(Buffer.byteLength(credentials[name]))).update(':').update(credentials[name]);
+  }
+  return hash.digest('hex');
+}
+
+function prepareGatewayRuntime(environment = process.env, {
+  directory = GATEWAY_RUNTIME_DIRECTORY, sourceDirectory = SECRET_DIRECTORY,
+  sourceUid = 0, parentUid = 0, uid = 1000, gid = 1000,
+} = {}) {
+  const credentials = gatewaySourceCredentials(environment, sourceDirectory, sourceUid);
+  const parent = fs.lstatSync(path.dirname(directory));
+  if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== parentUid ||
+      (parent.mode & 0o022) !== 0) throw new Error('unsafe gateway runtime parent');
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid ||
+        (stat.mode & 0o777) !== 0o700) throw new Error('unsafe gateway runtime directory');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fs.chownSync(directory, uid, gid);
+  }
+  const names = { token: 'token', cert: 'tls.crt', key: 'tls.key' };
+  for (const entry of fs.readdirSync(directory)) {
+    if (!Object.values(names).includes(entry)) throw new Error('unexpected gateway runtime file');
+    const stat = fs.lstatSync(path.join(directory, entry));
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== uid || stat.nlink !== 1 ||
+        (stat.mode & 0o777) !== 0o600) throw new Error('unsafe gateway runtime credential');
+  }
+  for (const [name, file] of Object.entries(names)) {
+    const temporary = path.join(directory, `.${file}.${process.pid}`);
+    const descriptor = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      fs.constants.O_NOFOLLOW, 0o600);
+    try {
+      try {
+        fs.fchownSync(descriptor, uid, gid);
+        fs.writeFileSync(descriptor, credentials[name]);
+        fs.fsyncSync(descriptor);
+      } finally { fs.closeSync(descriptor); }
+      fs.renameSync(temporary, path.join(directory, file));
+    } finally { try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+  }
+  return credentialSignature(credentials);
+}
+
+function parseDockerEnvironment(config) {
+  const directives = config.split('\n').filter((line) => /^\s*SetEnv\s/i.test(line));
+  if (directives.length !== 1) throw new Error('invalid daemon SSH environment');
+  const match = /^SetEnv DOCKER_HOST=(\S+) TESTCONTAINERS_HOST_OVERRIDE=(\S+) TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=(\S+)$/.exec(directives[0]);
+  if (!match) throw new Error('invalid daemon SSH environment');
+  return dockerEnvironment({ DOCKER_HOST: match[1], TESTCONTAINERS_HOST_OVERRIDE: match[2],
+    TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE: match[3] });
+}
+
+function gatewayLaunch(sshdConfig = fs.readFileSync(SSHD_CONFIG, 'utf8')) {
+  return {
+    command: SETPRIV_PATH,
+    // The daemon must retain the same trusted-user sudo contract as SSH sessions.
+    args: ['--reuid=1000', '--regid=1000', '--clear-groups', '--', NODE_PATH, GATEWAY_PATH],
+    options: { detached: false, env: { ...minimalEnvironment('/home/codex', 'codex'),
+      ...parseDockerEnvironment(sshdConfig) },
+      stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
+  };
+}
+
+// This service is optional: bootstrap failures, an absent Secret, or an app
+// server outage must never terminate or delay the existing SSH/Docker services.
+class OptionalGatewayService {
+  constructor({ launch = () => {
+    validateRootFile(GATEWAY_PATH);
+    const signature = prepareGatewayRuntime();
+    const spec = gatewayLaunch();
+    const child = childProcess.spawn(spec.command, spec.args, spec.options);
+    child.gatewaySignature = signature;
+    return child;
+  }, log = (message) => process.stderr.write(`codex-remote-devbox: ${message}\n`),
+  retryMs = 1000, maxRetryMs = 30000, listenTimeoutMs = 10000, credentialPollMs = 5000,
+  currentSignature = () => credentialSignature(gatewaySourceCredentials()) } = {}) {
+    Object.assign(this, { launch, log, retryMs, maxRetryMs, listenTimeoutMs, credentialPollMs, currentSignature });
+    this.delay = retryMs;
+    this.stopping = false;
+    this.closed = Promise.resolve();
+  }
+  start() {
+    if (this.stopping) return;
+    try {
+      this.child = this.launch();
+      this.closed = closePromise(this.child);
+    } catch { this.retry(); return; }
+    const child = this.child;
+    let handled = false;
+    const exited = () => {
+      if (handled) return;
+      handled = true;
+      clearTimeout(this.deadline);
+      clearInterval(this.credentialTimer);
+      clearTimeout(this.rotationKillTimer);
+      if (!this.stopping) this.retry();
+    };
+    child.once('error', () => signalChild(child, 'SIGKILL'));
+    child.once('close', exited);
+    child.on('message', (message) => {
+      if (message?.type === 'listening') clearTimeout(this.deadline);
+      if (message?.type === 'ready' && message.ready === true) this.delay = this.retryMs;
+    });
+    this.deadline = setTimeout(() => signalChild(child, 'SIGKILL'), this.listenTimeoutMs);
+    if (child.gatewaySignature) {
+      this.credentialTimer = setInterval(() => {
+        let unchanged = false;
+        try { unchanged = this.currentSignature() === child.gatewaySignature; } catch { /* Fail closed. */ }
+        if (unchanged) return;
+        clearInterval(this.credentialTimer);
+        this.log('app-server gateway credentials changed; reconnect required');
+        signalChild(child, 'SIGTERM');
+        this.rotationKillTimer = setTimeout(() => signalChild(child, 'SIGKILL'), 1000);
+      }, this.credentialPollMs);
+    }
+  }
+  retry() {
+    if (this.stopping) return;
+    this.log('optional app-server gateway unavailable; retrying');
+    this.timer = setTimeout(() => this.start(), this.delay);
+    this.delay = Math.min(this.delay * 2, this.maxRetryMs);
+  }
+  async stop() {
+    this.stopping = true;
+    clearTimeout(this.timer);
+    clearTimeout(this.deadline);
+    clearInterval(this.credentialTimer);
+    clearTimeout(this.rotationKillTimer);
+    signalChild(this.child, 'SIGTERM');
+    if (!await waitWithTimeout(this.closed, SERVICE_TERM_GRACE_MS)) {
+      signalChild(this.child, 'SIGKILL');
+      await waitWithTimeout(this.closed, 1000);
+    }
+  }
+}
+
 async function main() {
   if (process.argv.length !== 3 || process.getuid() !== 0 || process.getgid() !== 0) {
     throw new Error('supervisor invocation is invalid');
@@ -248,6 +403,7 @@ async function main() {
   prepareRuntimeDirectory();
   await removeStaleSocket();
 
+  let gateway = null;
   let bridge = null;
   let bridgeClosed = Promise.resolve();
   let sshd = null;
@@ -282,7 +438,7 @@ async function main() {
       let finalExitCode = exitCode;
       signalChild(bridge, 'SIGTERM');
       signalChild(sshd, 'SIGTERM');
-      const closed = Promise.all([bridgeClosed, sshdClosed]);
+      const closed = Promise.all([bridgeClosed, sshdClosed, gateway?.stop()]);
       await waitWithTimeout(closed, SERVICE_TERM_GRACE_MS);
       signalChild(bridge, 'SIGKILL');
       signalChild(sshd, 'SIGKILL');
@@ -367,6 +523,14 @@ async function main() {
       void shutdown(1);
     }
   });
+  try {
+    if (gatewayEnabled()) {
+      gateway = new OptionalGatewayService();
+      gateway.start();
+    }
+  } catch {
+    process.stderr.write('codex-remote-devbox: optional app-server selector is invalid\n');
+  }
 }
 
 if (require.main === module) {
@@ -377,6 +541,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  OptionalGatewayService,
+  gatewayLaunch,
+  prepareGatewayRuntime,
+  parseDockerEnvironment,
   bridgeLaunch,
   closePromise,
   minimalEnvironment,

@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-22
-- Last updated: 2026-09-26
+- Last updated: 2026-10-10
 
 ## Context
 
@@ -22,14 +22,14 @@ The image must provide a stable remote-user contract, accept credentials only at
 - Publish the remote-Docker client layer as revision `codex-0.149.0-r3`, without changing Codex or any `r2` state, SSH-server, process, signal, or no-init-container behavior.
 - Publish the supervised, Testcontainers-compatible Unix bridge as revision `codex-0.149.0-r4`, preserving Codex `0.149.0`, the exact nine-file Docker-host input contract, and the existing state and inbound-SSH interfaces.
 - Publish automatic runtime GHCR client authentication as revision `codex-0.149.0-r5`, preserving Codex, the remote-Docker bridge, both state mounts, and the inbound-SSH interface.
-- Upgrade Codex to `0.157.1` as current release `codex-0.157.1-r1`, preserving the `0.149.0-r5` runtime contracts, pinned Node base, and pinned Docker packages.
+- Upgrade Codex to `0.162.1` as current release `codex-0.162.1-r1`, preserving the `0.149.0-r5` runtime contracts, pinned Node base, and pinned Docker packages.
 - Reset the revision to `r1` when Codex changes. Increment the revision when packaging changes while the Codex version remains unchanged.
 - Do not publish moving tags such as `latest` or `stable`.
 
 ### Runtime contract
 
 - Build from `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`.
-- Install `@openai/codex@0.157.1` exactly and expose it on the SSH login shell's `PATH`.
+- Install `@openai/codex@0.162.1` exactly and expose it on the SSH login shell's `PATH`.
 - Run root `tini -g` to the validating entrypoint to an image-owned root supervisor. Run the Docker bridge as `codex` UID/GID `1000`, run OpenSSH as root, and enter authenticated sessions as `codex` using Bash.
 - Listen for SSH on TCP port `2222`.
 - Require explicit state mounts at `/home/codex` for user state and `/workspaces` for project checkouts. Each path must be a real, non-symlink directory and an exact mountpoint entry in `/proc/self/mountinfo`; an image-layer directory or a mount on only a parent path is rejected.
@@ -40,7 +40,7 @@ The image must provide a stable remote-user contract, accept credentials only at
 - Accept one or more bare OpenSSH public-key lines in the authorized-keys input. Reject per-key options and non-public-key file formats.
 - Fail closed when either required key is missing, empty, invalid, or unsafe to use. Do not generate an ephemeral host identity or log key material.
 - Permit public-key authentication only. Disable root, password, keyboard-interactive, agent forwarding, X11 forwarding, remote forwarding, banners, and MOTD output. Permit local forwarding only to loopback destinations on the devbox.
-- Do not start or expose a Codex app-server listener. Codex Desktop starts the app server through the SSH connection as described by the [Codex remote connections documentation](https://learn.chatgpt.com/docs/remote-connections).
+- Default mode does not start or expose App Server. [ADR 0002](0002-codex-app-server-access.md) adds an explicit opt-in WSS gateway and managed Unix daemon startup while preserving Desktop SSH access.
 - After validation and state bootstrap, have the supervisor prepare the private bridge runtime directory, remove only a verified stale Unix socket, start the bridge as UID/GID `1000`, wait for its ready socket, and then start foreground sshd as root. Treat an unexpected bridge or sshd exit as fatal, terminate the sibling, and exit nonzero. Forward container termination through bounded `TERM` then `KILL` cleanup for both services and all per-connection SSH children.
 - Require the Docker-host bundle at `/run/secrets/docker-host` with the exact files `docker_host`, `ssh_alias`, `ssh_host`, `ssh_port`, `ssh_user`, `ssh_client_ed25519_private_key`, `ssh_client_ed25519_fingerprint`, `ssh_host_ed25519_fingerprint`, and `ssh_known_hosts`. Each input is a regular, non-symlink, nonempty read-only source.
 - Fix both the image-owned SSH alias and `HostKeyAlias` to `docker-host`; keep `HostName` as the separately configured MagicDNS host. Validate safe field syntax, an Ed25519 client key and its derived fingerprint, and exactly one Ed25519 known-hosts entry keyed by `docker-host` and matching the stored host fingerprint. Never log those values.
@@ -89,7 +89,7 @@ The image must provide a stable remote-user contract, accept credentials only at
 - Consumers must provide both state mounts even for an otherwise ephemeral run. Persisting those mounts preserves authentication and project state across replacement.
 - The image normalizes ownership and mode of each mount root to its fixed private contract. Existing descendants retain their content, ownership, permissions, timestamps, and links because bootstrap is deliberately nonrecursive.
 - Base-image or package changes are traceable through OCI metadata and an incremented release revision even though those versions are intentionally omitted from the tag.
-- The `0.157.1` upstream native Codex payload is larger than `0.149.0`, increasing image storage and transfer requirements. This is accepted for the stable CLI upgrade; it does not change the startup process or permit a prestarted app-server TCP listener.
+- The `0.162.1` upstream native Codex payload is larger than `0.149.0`, increasing image storage and transfer requirements. This is accepted for the stable CLI upgrade; default startup remains unchanged; the opt-in App Server exception is governed by ADR 0002.
 - Docker and Testcontainers clients use the local image-owned Unix endpoint, which relays each connection to the pinned remote Mac engine through SSH. Build contexts are transferred to that engine, while bind-mount source paths resolve on the Mac and are not devbox `/workspaces` paths; the Testcontainers socket override presents the remote bind target as `/var/run/docker.sock`.
 - The local Unix endpoint is a secured transport, not a tenancy or resource-isolation boundary. All Devboxes using the shared Docker-host credential operate on the same Mac daemon: container names and state, networks, images, volumes, build cache, and CPU/memory contention are daemon-wide. Testcontainers and explicitly published (`-p`) ports bind on the Mac Docker host and may be reachable by LAN or tailnet peers as allowed by Docker Desktop, host-firewall, and tailnet policy. Revision `r5` introduces no Kubernetes-side Docker TCP endpoint, and separate client credentials cannot hide already-cached private image layers from another client of the same daemon.
 - Rollback from `r5` requires configuration staging while the helper still exists. Before a legacy-auth scrub, disable the exact helper mapping and the preserved legacy entry resumes. After scrub, retain `r5` helper/Vault continuity until a replacement client credential path is established; rolling directly to `r4` would leave the non-secret mapping unusable or leave the client without GHCR authentication.

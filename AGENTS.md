@@ -25,11 +25,15 @@ imageyard/
 ├── codex-remote-devbox/
 │   ├── .dockerignore
 │   ├── Dockerfile
+│   ├── app-server-gateway.js
+│   ├── app-server-gateway.test.js
+│   ├── app-server-gateway-smoke.sh
 │   ├── app-server-smoke.js
 │   ├── docker-bridge-client-smoke.js
 │   ├── docker-bridge.js
 │   ├── docker-bridge.test.js
 │   ├── entrypoint.sh
+│   ├── examples/app-server-client/
 │   ├── fake-docker-backend.py
 │   ├── fake-docker-sshd_config
 │   ├── ghcr-auth-command.sh
@@ -46,8 +50,10 @@ imageyard/
 │   └── codex-entrypoint.sh
 ├── docs/
 │   ├── adr/
-│   │   └── 0001-codex-remote-devbox-contract.md
+│   │   ├── 0001-codex-remote-devbox-contract.md
+│   │   └── 0002-codex-app-server-access.md
 │   ├── runbooks/
+│   │   ├── codex-app-server-access.md
 │   │   ├── codex-remote-devbox-release.md
 │   │   └── multica-runtime-release.md
 │   └── changelog.md
@@ -63,10 +69,10 @@ imageyard/
 - Directory and build context: `codex-remote-devbox/`
 - Dockerfile: `codex-remote-devbox/Dockerfile`
 - Base image: `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`
-- Codex CLI package: `@openai/codex@0.157.1`
+- Codex CLI package: `@openai/codex@0.162.1`
 - Published platforms: `linux/amd64`, `linux/arm64`
-- Canonical tag: `codex-0.157.1-r1`
-- Release target: `ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1`
+- Canonical tag: `codex-0.162.1-r1`
+- Release target: `ghcr.io/ytbits/codex-remote-devbox:codex-0.162.1-r1`
 - Docker client packages: `docker-ce-cli=5:29.7.2-1~debian.12~bookworm`, `docker-buildx-plugin=0.36.1-1~debian.12~bookworm`, and `docker-compose-plugin=5.5.0-1~debian.12~bookworm` from Docker's official Debian repository
 - SSH interface: TCP `2222`, public-key-only login as `codex` UID/GID `1000` with Bash
 - Required state mountpoints: `/home/codex` and `/workspaces`
@@ -103,11 +109,11 @@ Docker SSH URLs may specify the Mac's non-default socket path. Build contexts ar
 
 Treat the bridge as a transport, not an isolation boundary. All Devboxes using the shared Docker-host credential target one Mac daemon, so container names and state, networks, images, volumes, build cache, and CPU/memory contention are daemon-wide rather than Devbox-isolated. Testcontainers and `-p` published ports bind on the Mac Docker host and may be reachable by LAN or tailnet peers under Docker Desktop, host-firewall, and tailnet policy. Do not describe the private local Unix socket as tenancy isolation, and do not add Kubernetes-side Docker TCP exposure.
 
-Codex Desktop starts the remote app server through SSH. The image must expose only SSH over TCP, must not prestart or publish an app-server listener, and must keep the remote login shell's `PATH` free of noisy interactive-only setup. The process contract is root `tini -g` to the root validating entrypoint to the image-owned supervisor. The supervisor prepares and verifies the private bridge runtime directory, removes only a safely identified stale socket, starts the bridge as UID/GID `1000`, waits for its ready socket, and then starts foreground sshd as root. An unexpected bridge or sshd exit is fatal: terminate the sibling, clean up the owned socket safely, and exit nonzero. On container signals, send bounded `TERM` then `KILL` to both services; the bridge separately reaps every per-connection SSH child so no process or stale socket remains.
+Default startup exposes only SSH and does not prestart App Server. The explicit `CODEX_APP_SERVER_ENABLED=1` exception starts an independently supervised WSS gateway on `8443` and ensures the existing managed Unix daemon is running as UID/GID `1000`. Optional `CODEX_APP_SERVER_ORDINAL` must match the `codex-devbox-N` hostname before activation. Preserve the desktop Unix/SSH path and do not create a separate competing App Server for the same Home. Keep the remote login shell's `PATH` free of noisy interactive-only setup. See ADR 0002 and the App Server access runbook. The process contract is root `tini -g` to the root validating entrypoint to the image-owned supervisor. The supervisor prepares and verifies the private bridge runtime directory, removes only a safely identified stale socket, starts the bridge as UID/GID `1000`, waits for its ready socket, and then starts foreground sshd as root. An unexpected bridge or sshd exit is fatal: terminate the sibling, clean up the owned socket safely, and exit nonzero. On container signals, send bounded `TERM` then `KILL` to both services; the bridge separately reaps every per-connection SSH child so no process or stale socket remains.
 
 Codex remote devbox tags use `codex-<CODEX_VERSION>-r<REVISION>`. Reset to `r1` when Codex changes; increment the revision for packaging changes at the same Codex version. Never publish or overwrite a moving tag. Base-image and system-package versions belong in the Dockerfile, OCI labels, and documentation, not in the tag.
 
-The `0.157.1` release preserves all runtime contracts from `codex-0.149.0-r5` and leaves the pinned Node base and Docker packages unchanged. Its larger upstream native payload increases image storage and transfer requirements. On both target architectures, run a bounded app-server stdio protocol check through authenticated SSH on fresh and reused Home fixtures: send `initialize`, require the exact Codex version, `codexHome=/home/codex/.codex`, `platformFamily=unix`, and `platformOs=linux` in its response, send `initialized`, and require a successful `config/read` response without printing configuration values. Close input and require clean shutdown. Verify that this invocation adds no TCP listener and that container startup still does not prestart an app server.
+The `0.162.1` release preserves default SSH, state, Docker and GHCR behavior and adds the optional App Server contract. Keep its token and TLS key in runtime Secret files, copy them only into the private `/run` runtime directory, never Home or Workspace, and never log their contents or upstream configuration. Authenticate before proxying a WebSocket handshake, reject browser Origin headers, verify upstream Unix socket ownership, and keep `/readyz` dependent on an actual upstream upgrade. Gateway failure must not stop SSH, restart the desktop daemon unnecessarily, or become a whole-Pod readiness dependency. Pin the exact Codex version and run both architecture suites: default SSH stdio initialize/config-read and opt-in WSS authentication/protocol/recovery. Never call a real model in these tests. See [App Server access](docs/runbooks/codex-app-server-access.md).
 
 Validation and publication remain separate. The validation workflow has read-only repository permissions and builds and smoke-tests both target platforms. The publish workflow is limited to image-producing changes on `main` or manual dispatches targeting `main`, owns the GHCR write permission, and checks the exact immutable tag before building and again immediately before pushing. Registry authentication, network, or ambiguous-not-found failures must stop publication. After a successful push, bounded read-only retries may tolerate registry read-after-write visibility, but all evidence must remain anchored to the pushed index digest; retry exhaustion or any digest mismatch fails verification and must never cause a republish.
 
