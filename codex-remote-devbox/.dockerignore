@@ -7,3 +7,4 @@
 !ghcr-credential-helper.js
 !sshd_config
 !supervisor.js
+!app-server-gateway.js

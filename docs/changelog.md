@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-10 - Prepare opt-in Codex App Server access
+
+- Target stable Codex CLI `0.162.1` and immutable image `codex-0.162.1-r1`; retain existing Node and Docker pins.
+- Add an explicitly enabled WSS gateway to the existing Unix daemon, private runtime token/TLS inputs, independent recovery, and an ordinal selector for canary adoption.
+- Add a Node/TypeScript client, protocol/authentication/recovery verification, and document that publication and cluster rollout remain separate actions.
+
+
 ## 2026-09-26 - Upgrade Codex Remote Devbox to 0.157.1
 
 - Upgraded the Codex remote devbox from CLI `0.149.0` to stable `0.157.1` and reset the immutable image revision to `ghcr.io/ytbits/codex-remote-devbox:codex-0.157.1-r1`.

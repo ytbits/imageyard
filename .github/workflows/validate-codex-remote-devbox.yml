@@ -11,8 +11,10 @@ on:
       - "docs/changelog.md"
       - "docs/adr/README.md"
       - "docs/adr/0001-codex-remote-devbox-contract.md"
+      - "docs/adr/0002-codex-app-server-access.md"
       - "docs/runbooks/README.md"
       - "docs/runbooks/codex-remote-devbox-release.md"
+      - "docs/runbooks/codex-app-server-access.md"
   workflow_call:
   workflow_dispatch:
 
@@ -20,8 +22,8 @@ permissions:
   contents: read
 
 env:
-  EXPECTED_CODEX_VERSION: 0.157.1
-  EXPECTED_IMAGE_TAG: codex-0.157.1-r1
+  EXPECTED_CODEX_VERSION: 0.162.1
+  EXPECTED_IMAGE_TAG: codex-0.162.1-r1
   EXPECTED_NODE_VERSION: 24.19.0
   EXPECTED_DOCKER_CLI_PACKAGE_VERSION: 5:29.7.2-1~debian.12~bookworm
   EXPECTED_DOCKER_BUILDX_PACKAGE_VERSION: 0.36.1-1~debian.12~bookworm
@@ -42,12 +44,19 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.19.0"
+
       - name: Check source syntax and bridge behavior
         shell: bash
         run: |
           set -euo pipefail
           sh -n codex-remote-devbox/entrypoint.sh
           bash -n codex-remote-devbox/smoke-test.sh
+          bash -n codex-remote-devbox/app-server-gateway-smoke.sh
+          node --check codex-remote-devbox/app-server-gateway.js
           node --check codex-remote-devbox/app-server-smoke.js
           node --check codex-remote-devbox/docker-bridge.js
           node --check codex-remote-devbox/docker-bridge-client-smoke.js
@@ -57,9 +66,17 @@ jobs:
           node --check codex-remote-devbox/supervisor.js
           node --test \
             codex-remote-devbox/docker-bridge.test.js \
-            codex-remote-devbox/ghcr-auth.test.js
+            codex-remote-devbox/ghcr-auth.test.js \
+            codex-remote-devbox/app-server-gateway.test.js
           python3 -c 'compile(open("codex-remote-devbox/fake-docker-backend.py", encoding="utf-8").read(), "codex-remote-devbox/fake-docker-backend.py", "exec")'
           git diff --check HEAD^ HEAD
+
+      - name: Validate App Server client
+        working-directory: codex-remote-devbox/examples/app-server-client
+        run: |
+          npm ci --ignore-scripts
+          npm run typecheck
+          npm test
 
       - name: Check workflow YAML syntax
         shell: bash
@@ -283,6 +300,15 @@ jobs:
             --mount "type=bind,src=$fixture_dir,dst=/run/codex-remote-devbox,readonly" \
             "$IMAGE" \
             -t -f /etc/ssh/sshd_config
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.19.0"
+
+      - name: Install smoke client dependencies
+        working-directory: codex-remote-devbox/examples/app-server-client
+        run: npm ci --ignore-scripts
 
       - name: Run smoke tests
         shell: bash
