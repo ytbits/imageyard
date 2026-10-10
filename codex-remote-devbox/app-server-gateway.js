@@ -143,7 +143,6 @@ class AppServerGateway {
     };
     socket.on('error', () => {});
     if (this.closing) { reject('503 Service Unavailable'); return; }
-    if (hasHeader(request, 'origin')) { reject('403 Forbidden'); return; }
     const key = request.headers['sec-websocket-key'];
     if (request.method !== 'GET' || request.url !== '/' || request.headers.upgrade?.toLowerCase() !== 'websocket' ||
         request.headers['sec-websocket-version'] !== '13' || typeof key !== 'string' ||

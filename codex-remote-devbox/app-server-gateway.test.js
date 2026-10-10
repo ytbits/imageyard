@@ -113,13 +113,20 @@ test('plain WebSocket connects without credentials and relays bytes unchanged', 
   socket.destroy();
 });
 
-test('every Origin and unsupported handshake fail before upstream', async (t) => {
+test('valid WebSocket upgrades with an Origin header are accepted', async (t) => {
+  const f = await fixture(t);
+  for (const origin of ['https://caller.example', 'null', '']) {
+    const { status, socket } = await f.connect({ Origin: origin });
+    assert.equal(status, 101);
+    socket.destroy();
+  }
+});
+
+test('unsupported handshake fails before upstream', async (t) => {
   const f = await fixture(t);
   await f.gateway.probe();
   const before = f.requests.length;
   const cases = [
-    [{ Origin: 'https://localhost' }, '/', 403],
-    [{ Origin: '' }, '/', 403],
     [{}, '/?ignored=yes', 400],
     [{ 'Sec-WebSocket-Protocol': 'jsonrpc' }, '/', 400],
     [{ 'Sec-WebSocket-Key': 'invalid' }, '/', 400],

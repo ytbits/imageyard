@@ -21,21 +21,21 @@ dependencies are only needed for type checking/tests; the runtime needs `ws`.
 
 ## Connection smoke (does not start work)
 
-After a separately approved deployment, run this from a caller Pod:
+After a separately approved deployment, run this from a device on the tailnet:
 
 ```bash
-export CODEX_APP_SERVER_URL=ws://codex-devbox-2.codex-devbox-headless.codex-devbox.svc:8787/
+export CODEX_APP_SERVER_URL=ws://codex-devbox-2:8787/
 npm run smoke
 ```
 
-The URL is the only connection setting. This specific Pod DNS record uses the
-existing StatefulSet headless Service; it resolves Devbox 2 directly, with no new
-Service or load balancer. A Pod IP also works, but it can change after a restart.
-Use the named Pod so a reconnect finds the same Devbox's persistent state.
+The URL is the only connection setting. Use the device's full MagicDNS name if
+the short name is unavailable. The existing Tailscale-exposed Service selects
+only Devbox 2, so reconnecting returns to its persistent state. Cluster clients
+can use `ws://codex-devbox-2.codex-devbox.svc:8787/` for the same endpoint.
 
-This endpoint has no token or TLS and assumes a trusted cluster network. Anyone
-who can reach it can control this Devbox. It is not published through Tailscale
-or an ingress. Redirects are not followed.
+This endpoint has no application token or TLS configuration. It uses the
+existing Tailscale network access, with no new caller-specific rules. Any client
+that can reach it can control this Devbox. Redirects are not followed.
 
 `smoke.ts` initializes, sends `initialized`, and requests `thread/list` with
 `useStateDbOnly: true` to avoid rollout metadata scan/repair. It prints neither
@@ -68,7 +68,7 @@ starts real agent work and can consume provider quota.
 import { AppServerClient, RpcError } from './client.ts';
 
 const endpoint = {
-  url: 'ws://codex-devbox-2.codex-devbox-headless.codex-devbox.svc:8787/',
+  url: 'ws://codex-devbox-2:8787/',
 };
 const client = await AppServerClient.connect({
   ...endpoint,
@@ -148,7 +148,7 @@ turn of the same conversation. During a turn, use
 
 On reconnect, create a **new** initialized client with the saved Devbox endpoint,
 then call `client.resumeThread(savedThreadId)`. Thread state belongs to that
-Devbox's persistent home. Keep the saved Pod DNS name and thread id together;
+Devbox's persistent home. Keep the saved Devbox endpoint and thread id together;
 do not resume against another Devbox. Do not repeat `initialize` on the old connection.
 
 `OutcomeUnknownError` means a request or turn deadline expired or the connection
